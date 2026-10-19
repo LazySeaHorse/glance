@@ -221,11 +221,24 @@ static bool PutBytes(UINT format, const void* data, size_t size) {
     return true;
 }
 
+static bool OpenClipboardRetry(HWND owner) {
+    for (int i = 0; i < 10; i++) {
+        if (OpenClipboard(owner)) return true;
+        Sleep(15);  // another app may hold it briefly
+    }
+    return false;
+}
+
+bool SetClipboardText(HWND owner, const std::wstring& text) {
+    if (!OpenClipboardRetry(owner)) return false;
+    EmptyClipboard();
+    const bool ok = PutBytes(CF_UNICODETEXT, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+    CloseClipboard();
+    return ok;
+}
+
 bool SetClipboard(HWND owner, const ClipData& data) {
-    if (!data.ok) return false;
-    bool opened = false;
-    for (int i = 0; i < 10 && !(opened = OpenClipboard(owner)); i++) Sleep(15);  // another app may hold it briefly
-    if (!opened) return false;
+    if (!data.ok || !OpenClipboardRetry(owner)) return false;
     EmptyClipboard();
     bool ok = true;
     // The file itself, so pasting into Explorer, chat apps or mail attaches the original.

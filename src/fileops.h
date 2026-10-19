@@ -30,3 +30,6 @@ void PrepareClipboard(const std::wstring& path, int quarterTurns, ClipData& out)
 
 // Puts the file, the bitmap and (if present) the PNG on the clipboard.
 bool SetClipboard(HWND owner, const ClipData& data);
+
+// Puts plain text on the clipboard.
+bool SetClipboardText(HWND owner, const std::wstring& text);

@@ -2075,6 +2075,13 @@ void OnCopied(ClipData* data) {
     ShowToast(ok ? L"Copied" : L"Couldn’t copy this photo", 1.6);
 }
 
+// The path or just the file name, as text (small enough to do right here).
+void CopyPathText(bool nameOnly) {
+    if (g_curPath.empty() || g_closing) return;
+    const bool ok = SetClipboardText(g.hwnd, nameOnly ? FileName(g_curPath) : g_curPath);
+    ShowToast(ok ? (nameOnly ? L"File name copied" : L"Path copied") : L"Couldn’t copy", 1.6);
+}
+
 void RevealCurrent() {
     if (g_curPath.empty()) return;
     AllowSetForegroundWindow(ASFW_ANY);
@@ -2362,6 +2369,8 @@ void KeyInfo(UINT) { ToggleInfo(); }
 void KeyDelete(UINT) { DeleteCurrent(); }
 void KeyUndo(UINT) { UndoDelete(); }
 void KeyCopy(UINT) { CopyCurrent(); }
+void KeyCopyPath(UINT) { CopyPathText(false); }
+void KeyCopyName(UINT) { CopyPathText(true); }
 void KeyReveal(UINT) { RevealCurrent(); }
 void KeyNext(UINT) {
     g_slideshow = false;
@@ -2423,6 +2432,8 @@ const KeyDef kKeys[] = {
 
     {0, 0, 0, nullptr, nullptr, L"Photo"},
     {'I', 'I', 0, KeyInfo, L"I", L"Photo info"},
+    {'C', 'C', M_CTRL | M_SHIFT, KeyCopyPath, L"Ctrl+Shift+C", L"Copy the path"},
+    {'C', 'C', M_CTRL | M_ALT, KeyCopyName, L"Ctrl+Alt+C", L"Copy the file name"},
     {'C', 'C', M_CTRL, KeyCopy, L"Ctrl+C", L"Copy the photo"},
     {'E', 'E', M_CTRL, KeyReveal, L"Ctrl+E", L"Show in Explorer"},
     {VK_DELETE, VK_DELETE, 0, KeyDelete, L"Delete   Ctrl+Z", L"Delete / undo"},
