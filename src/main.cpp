@@ -160,6 +160,8 @@ std::vector<std::wstring> g_exts;
 std::vector<std::wstring> g_files;
 std::unordered_map<std::wstring, int> g_fileIndex;
 std::unordered_map<std::wstring, Entry> g_entries;
+SortOrder g_sort;                                  // how the folder is ordered
+std::unordered_map<std::wstring, uint64_t> g_mtime;  // date modified of the files in the folder
 int g_cur = 0;
 std::wstring g_curPath;
 int g_prevDir = 1;
@@ -340,9 +342,20 @@ std::wstring DirName(const std::wstring& p) {
     return s == std::wstring::npos ? L"." : p.substr(0, s);
 }
 
-// The folder's order: file names, with numbers compared as numbers (like Explorer).
-bool ByName(const std::wstring& a, const std::wstring& b) {
-    return StrCmpLogicalW(FileName(a).c_str(), FileName(b).c_str()) < 0;
+uint64_t FileTime(const FILETIME& t) { return ((uint64_t)t.dwHighDateTime << 32) | t.dwLowDateTime; }
+
+// Date modified, from what the folder scan saw (or the file itself if it wasn't listed).
+uint64_t MTime(const std::wstring& p) {
+    auto it = g_mtime.find(p);
+    if (it != g_mtime.end()) return it->second;
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    const uint64_t t = GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d) ? FileTime(d.ftLastWriteTime) : 0;
+    return g_mtime[p] = t;
+}
+
+// The folder's order (N and D choose it). Names compare with numbers as numbers, like Explorer.
+bool InOrder(const std::wstring& a, const std::wstring& b) {
+    return OrderBefore(g_sort, StrCmpLogicalW(FileName(a).c_str(), FileName(b).c_str()), MTime(a), MTime(b));
 }
 
 // ---------------------------------------------------------------- device setup
@@ -2053,6 +2066,8 @@ struct ListMsg {
     uint32_t gen;
     std::wstring target;
     std::vector<std::wstring> files;
+    std::vector<uint64_t> times;  // date modified of each file
+    SortOrder order;              // the order `files` is in
     std::vector<std::wstring> exts;  // filled when the scan had to discover codecs itself
 };
 
@@ -2060,14 +2075,16 @@ void ScanFolderAsync(const std::wstring& file) {
     const uint32_t gen = ++g_scanGen;
     HWND hwnd = g.hwnd;
     std::vector<std::wstring> exts = g_exts;
-    std::thread([gen, file, hwnd, exts]() mutable {
-        auto* msg = new ListMsg{gen, file, {}, {}};
+    const SortOrder order = g_sort;
+    std::thread([gen, file, hwnd, exts, order]() mutable {
+        auto* msg = new ListMsg{gen, file, {}, {}, order, {}};
         if (exts.empty()) {  // first scan: ask Windows which codecs exist (kept off the startup path)
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             exts = SupportedExtensions();
             msg->exts = exts;
         }
         const std::wstring dir = DirName(file);
+        std::vector<std::pair<std::wstring, uint64_t>> found;
         WIN32_FIND_DATAW fd;
         HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
                                     FIND_FIRST_EX_LARGE_FETCH);
@@ -2076,11 +2093,18 @@ void ScanFolderAsync(const std::wstring& file) {
                 if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))
                     continue;
                 if (!HasExtension(fd.cFileName, exts)) continue;
-                msg->files.push_back(dir + L"\\" + fd.cFileName);
+                found.emplace_back(dir + L"\\" + fd.cFileName, FileTime(fd.ftLastWriteTime));
             } while (FindNextFileW(h, &fd));
             FindClose(h);
         }
-        std::sort(msg->files.begin(), msg->files.end(), ByName);
+        std::sort(found.begin(), found.end(), [order](const auto& a, const auto& b) {
+            return OrderBefore(order, StrCmpLogicalW(FileName(a.first).c_str(), FileName(b.first).c_str()), a.second,
+                               b.second);
+        });
+        for (auto& f : found) {
+            msg->files.push_back(std::move(f.first));
+            msg->times.push_back(f.second);
+        }
         if (!PostMessageW(hwnd, WM_APP_LIST, 0, (LPARAM)msg)) delete msg;
     }).detach();
 }
@@ -2091,6 +2115,10 @@ void OnList(ListMsg* m) {
         return;
     }
     std::vector<std::wstring> files = std::move(m->files);
+    g_mtime.clear();
+    for (size_t i = 0; i < files.size(); i++) g_mtime[files[i]] = m->times[i];
+    // The order may have been changed (N, D) while the scan ran.
+    if (m->order != g_sort) std::stable_sort(files.begin(), files.end(), InOrder);
     if (g_exts.empty() && !m->exts.empty()) {
         g_exts = std::move(m->exts);
         if (g_trace) {
@@ -2107,7 +2135,7 @@ void OnList(ListMsg* m) {
             break;
         }
     if (idx < 0) {  // opened something the folder scan didn't list; keep it in sequence
-        auto it = std::lower_bound(files.begin(), files.end(), g_curPath, ByName);
+        auto it = std::lower_bound(files.begin(), files.end(), g_curPath, InOrder);
         idx = (int)(it - files.begin());
         files.insert(it, g_curPath);
     } else if (files[idx] != g_curPath) {  // same file, different case: keep our key
@@ -2329,7 +2357,7 @@ void OnRecycled(bool ok, std::wstring* path) {
     }
     // Couldn't delete (in use, read-only, gone offline...): put it back where it belongs.
     if (!g_closing && !g_fileIndex.count(*p) && GetFileAttributesW(p->c_str()) != INVALID_FILE_ATTRIBUTES) {
-        auto it = std::lower_bound(g_files.begin(), g_files.end(), *p, ByName);
+        auto it = std::lower_bound(g_files.begin(), g_files.end(), *p, InOrder);
         const int idx = (int)(it - g_files.begin());
         g_files.insert(it, *p);
         if (idx <= g_cur) g_cur++;
@@ -2397,6 +2425,38 @@ void ToggleInfo() {
 
 void ToggleHelp() {
     g_helpOpen = !g_helpOpen;
+    g.needsRedraw = true;
+}
+
+// ---------------------------------------------------------------- order
+
+const wchar_t* kSettingsKey = L"Software\\Glance";
+
+void LoadSort() {
+    DWORD v = 0, size = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"Sort", RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS)
+        g_sort = UnpackSort(v);
+}
+
+void SaveSort() {
+    const DWORD v = PackSort(g_sort);
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"Sort", REG_DWORD, &v, sizeof(v));
+}
+
+// N sorts by name, D by date modified; the same key again reverses.
+void PressSort(int key) {
+    if (g_closing || g_files.empty()) return;
+    g_sort = PressSortKey(g_sort, key);
+    SaveSort();
+    std::stable_sort(g_files.begin(), g_files.end(), InOrder);
+    RebuildIndex();
+    auto it = g_fileIndex.find(g_curPath);
+    if (it != g_fileIndex.end()) g_cur = it->second;
+    Evict();
+    RequestDecodes();
+    const wchar_t* text = key == SORT_NAME ? (g_sort.desc ? L"Sorted by name, Z to A" : L"Sorted by name, A to Z")
+                                           : (g_sort.desc ? L"Sorted by date, newest first" : L"Sorted by date, oldest first");
+    ShowToast(text, 1.8);
     g.needsRedraw = true;
 }
 
@@ -2575,10 +2635,13 @@ void OnRenamed(RenameMsg* msg) {
         node.key() = m->to;
         g_entries.insert(std::move(node));
     }
+    const uint64_t when = MTime(m->from);  // renaming doesn't change the date
+    g_mtime.erase(m->from);
+    g_mtime[m->to] = when;
     auto at = std::find(g_files.begin(), g_files.end(), m->from);
     if (at != g_files.end()) {
         g_files.erase(at);
-        g_files.insert(std::lower_bound(g_files.begin(), g_files.end(), m->to, ByName), m->to);
+        g_files.insert(std::lower_bound(g_files.begin(), g_files.end(), m->to, InOrder), m->to);
     }
     const bool wasCurrent = g_curPath == m->from;
     if (wasCurrent) g_curPath = m->to;
@@ -2919,6 +2982,8 @@ void KeyJump(UINT vk) {
     g_slideshow = false;
     Navigate(idx, APPEAR_CUT);
 }
+void KeySortName(UINT) { PressSort(SORT_NAME); }
+void KeySortDate(UINT) { PressSort(SORT_DATE); }
 void KeyFirst(UINT) { Navigate(0, APPEAR_SLIDE); }
 void KeyLast(UINT) { Navigate((int)g_files.size() - 1, APPEAR_SLIDE); }
 void KeyPan(UINT vk) {
@@ -2950,6 +3015,8 @@ const KeyDef kKeys[] = {
     {VK_NUMPAD0, VK_NUMPAD9, 0, KeyJump, nullptr, nullptr},
     {VK_HOME, VK_HOME, 0, KeyFirst, L"Home", L"First photo"},
     {VK_END, VK_END, 0, KeyLast, L"End", L"Last photo"},
+    {'N', 'N', 0, KeySortName, L"N   D", L"Sort by name / date (again: flip)"},
+    {'D', 'D', 0, KeySortDate, nullptr, nullptr},
     {VK_F5, VK_F5, 0, KeySlideshow, L"S   F5", L"Slideshow"},
     {'S', 'S', 0, KeySlideshow, nullptr, nullptr},
 
@@ -3269,6 +3336,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     ShowWindow(g.hwnd, SW_SHOW);
     SetForegroundWindow(g.hwnd);
     Trace(L"window shown");
+    LoadSort();
     ScanFolderAsync(g_curPath);
 
     MSG msg;
