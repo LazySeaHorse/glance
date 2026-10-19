@@ -222,6 +222,12 @@ struct PendingDelete {
 std::vector<PendingDelete> g_pendingDel;  // hidden now, recycled after a grace period (undoable until then)
 const double kDeleteGrace = 6.0;
 const int kJumpCount = 10;  // the number keys 1-9 and 0 jump to the first ten photos
+// Colour picker (P): the colour under the pointer, read back from the bitmap on screen.
+struct Picker {
+    bool on = false, valid = false;
+    uint8_t r = 0, g = 0, b = 0, a = 255;  // straight (not premultiplied) sRGB, as displayed
+    ComPtr<ID2D1Bitmap1> stage;            // 1x1 and CPU-readable; made on first use
+} g_pick;
 struct Touchpad {
     bool seenSmallH = false;  // has sent sub-notch horizontal scrolls: a precision touchpad
     bool swiping = false;
@@ -1222,7 +1228,7 @@ void UpdateUiTarget() {
             g.needsRedraw = true;
         }
     }
-    if (!show && g_ui.target > 0.5 && GetForegroundWindow() == g.hwnd) SetCursor(nullptr);  // hide with the controls
+    if (!show && g_ui.target > 0.5 && !g_pick.on && GetForegroundWindow() == g.hwnd) SetCursor(nullptr);  // hide with the controls
     g_ui.target = show ? 1 : 0;
 }
 
@@ -1332,12 +1338,17 @@ void DrawTiles(const Entry& e, double rotDeg, double zoom, double cx, double cy,
     g.ctx->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
+// The bitmap that stands for the photo on screen at zoom z.
+const Bmp* DrawnBitmap(const Entry& e, double z) {
+    return e.anim.size() > 1 ? &e.anim[std::min(g_animIdx, (int)e.anim.size() - 1)] : Choose(e, e.w * z);
+}
+
 void DrawCurrent(bool hq) {
     Entry* e = Cur();
     View& v = g_view;
     if (!e || !v.appeared) return;
     const double z = v.zoom.x * v.scale.x;
-    const Bmp* b = (e->anim.size() > 1) ? &e->anim[std::min(g_animIdx, (int)e->anim.size() - 1)] : Choose(*e, e->w * z);
+    const Bmp* b = DrawnBitmap(*e, z);
     if (!b) return;
     if (e->anim.size() > 1) {  // frames replace each other directly; no sharpening crossfade
         v.shown = *b;
@@ -1455,6 +1466,7 @@ void DrawUi(bool hq) {
             t += buf;
         }
         if (g_slideshow) t += L"     Slideshow";
+        if (g_pick.on) t += L"     Colour picker";
         DrawLabel(t, g.font.get(), 28 * s, 30 * s, g.W - 120 * s, a);
     }
 
@@ -1722,6 +1734,91 @@ void DrawHelp() {
     g.ctx->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
+// The colour at screen position (px, py): finds the texel of the bitmap (or
+// full-resolution tile) drawn there and copies just that one back from the GPU.
+bool SamplePick(int px, int py) {
+    g_pick.valid = false;
+    Entry* e = Cur();
+    View& v = g_view;
+    if (!e || !e->info || !v.appeared || px < 0) return false;
+    const double z = v.zoom.x * v.scale.x;
+    const Bmp* b = DrawnBitmap(*e, z);
+    if (!b) return false;
+    const ImageXf xf = PhotoTransform(e->w, e->h, e->orient, b->upright, v.rot.x, z, g.W / 2.0 + v.panX.x + v.offX.x,
+                                      g.H / 2.0 + v.panY.x, true);
+    D2D1::Matrix3x2F inv = xf.m;
+    if (!xf.aligned || !inv.Invert()) return false;
+    const D2D1_POINT_2F l = inv.TransformPoint(D2D1::Point2F(px + 0.5f, py + 0.5f));
+    const float u = l.x + xf.w / 2.0f, w = l.y + xf.h / 2.0f;  // position in the picture, in its own pixels
+    if (u < 0 || w < 0 || u >= xf.w || w >= xf.h) return false;
+
+    ID2D1Bitmap1* src = nullptr;
+    int sx = 0, sy = 0;
+    const FullRes& f = e->full;
+    if (!f.tiles.empty() && e->w * z > b->w * 1.03) {  // sharper tiles are drawn over the picture
+        const int fx = (int)(u * f.lw / e->w), fy = (int)(w * f.lh / e->h);
+        for (const Tile& t : f.tiles)
+            if (fx >= t.x0 && fx < t.x1 && fy >= t.y0 && fy < t.y1) {
+                src = t.b.b.get();
+                sx = t.gl + fx - t.x0;
+                sy = t.gt + fy - t.y0;
+                break;
+            }
+    }
+    if (!src) {
+        src = b->b.get();
+        sx = std::min((int)(u * b->w / xf.w), b->w - 1);
+        sy = std::min((int)(w * b->h / xf.h), b->h - 1);
+    }
+    if (!g_pick.stage) {
+        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        if (FAILED(g.ctx->CreateBitmap(D2D1::SizeU(1, 1), nullptr, 0, &bp, g_pick.stage.put()))) return false;
+    }
+    const D2D1_POINT_2U to{0, 0};
+    const D2D1_RECT_U from = D2D1::RectU(sx, sy, sx + 1, sy + 1);
+    D2D1_MAPPED_RECT m{};
+    if (FAILED(g_pick.stage->CopyFromBitmap(&to, src, &from)) || FAILED(g_pick.stage->Map(D2D1_MAP_OPTIONS_READ, &m)))
+        return false;
+    const uint8_t* q = m.bits;  // premultiplied BGRA
+    const unsigned a = q[3];
+    auto straight = [a](unsigned c) { return (uint8_t)(a ? std::min(255u, (c * 255 + a / 2) / a) : 0u); };
+    g_pick.b = straight(q[0]);
+    g_pick.g = straight(q[1]);
+    g_pick.r = straight(q[2]);
+    g_pick.a = (uint8_t)a;
+    g_pick.stage->Unmap();
+    g_pick.valid = true;
+    return true;
+}
+
+void DrawPick() {
+    if (!g_pick.on || !g_pick.valid || g_closing) return;
+    const float s = g.s;
+    wchar_t t[64];
+    int n = swprintf(t, 64, L"#%02X%02X%02X     %d, %d, %d", g_pick.r, g_pick.g, g_pick.b, g_pick.r, g_pick.g, g_pick.b);
+    if (g_pick.a < 255) swprintf(t + n, 64 - n, L"     %d%% opaque", (g_pick.a * 100 + 127) / 255);
+    auto lay = Layout(t, g.font.get(), 400 * s, false);
+    if (!lay) return;
+    const float tw = LayoutWidth(lay.get()), th = LayoutHeight(lay.get());
+    const float padX = 12 * s, padY = 8 * s, sw = th, gap = 10 * s;
+    const float bw = padX + sw + gap + tw + padX, bh = th + 2 * padY;
+    float x = g_lastMouse.x + 20 * s, y = g_lastMouse.y + 24 * s;
+    if (x + bw > g.W) x = g_lastMouse.x - 20 * s - bw;  // flip to stay on screen
+    if (y + bh > g.H) y = g_lastMouse.y - 24 * s - bh;
+    const D2D1_RECT_F r = D2D1::RectF(x, y, x + bw, y + bh);
+    Color(0.08f, 0.08f, 0.09f, 0.88f);
+    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(r, 10 * s, 10 * s), g.brush.get());
+    const D2D1_RECT_F sq = D2D1::RectF(x + padX, y + padY, x + padX + sw, y + padY + sw);
+    g.brush->SetColor(D2D1::ColorF(g_pick.r / 255.0f, g_pick.g / 255.0f, g_pick.b / 255.0f, 1));
+    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(sq, 4 * s, 4 * s), g.brush.get());
+    Color(1, 1, 1, 0.3f);
+    g.ctx->DrawRoundedRectangle(D2D1::RoundedRect(sq, 4 * s, 4 * s), g.brush.get(), 1.0f, nullptr);
+    Color(1, 1, 1, 0.95f);
+    g.ctx->DrawTextLayout(D2D1::Point2F(x + padX + sw + gap, y + padY), lay.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+}
+
 void DrawSpinner() {
     const float s = g.s;
     const double t = Now();
@@ -1747,6 +1844,7 @@ void ReleaseGpu();
 bool RecreateGpu();
 
 void Render(bool hq) {
+    if (g_pick.on) SamplePick(g_lastMouse.x, g_lastMouse.y);
     g.ctx->BeginDraw();
     g.ctx->SetTransform(D2D1::Matrix3x2F::Identity());
     const float bg = (float)std::clamp(g_bg.x, 0.0, 1.0) * kBgAlpha;
@@ -1771,6 +1869,7 @@ void Render(bool hq) {
     DrawUi(hq);
     DrawInfoPanel();
     DrawHelp();
+    DrawPick();
     DrawToast();
     HRESULT hr = g.ctx->EndDraw();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -1792,6 +1891,7 @@ void ReleaseGpu() {
         kv.second.anim.clear();
     }
     g_ghosts.clear();
+    g_pick.stage.reset();
     g_view.shown = Bmp();
     g_view.prev = Bmp();
     g.desktop.reset();
@@ -2178,6 +2278,22 @@ void CopyPathText(bool nameOnly) {
     ShowToast(ok ? (nameOnly ? L"File name copied" : L"Path copied") : L"Couldn’t copy", 1.6);
 }
 
+// Click while picking: hex, or R, G, B with Shift.
+void CopyPickedColour(int x, int y, bool decimal) {
+    g_lastMouse = {x, y};
+    if (!SamplePick(x, y)) return;
+    wchar_t t[32];
+    if (decimal) swprintf(t, 32, L"%d, %d, %d", g_pick.r, g_pick.g, g_pick.b);
+    else swprintf(t, 32, L"#%02X%02X%02X", g_pick.r, g_pick.g, g_pick.b);
+    ShowToast(SetClipboardText(g.hwnd, t) ? std::wstring(L"Copied ") + t : L"Couldn’t copy", 1.6);
+}
+
+void TogglePicker() {
+    g_pick.on = !g_pick.on;
+    if (!g_pick.on) g_pick.stage.reset();
+    g.needsRedraw = true;
+}
+
 void RevealCurrent() {
     if (g_curPath.empty()) return;
     AllowSetForegroundWindow(ASFW_ANY);
@@ -2334,6 +2450,7 @@ void OnMouseMove(int x, int y) {
     if (x != g_lastMouse.x || y != g_lastMouse.y) {
         g_lastMouse = {x, y};
         if (g_ui.target < 0.5 && !g_closing) SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        if (g_pick.on) g.needsRedraw = true;  // the readout follows the pointer
         Activity();
     }
     UpdateHover((float)x, (float)y);
@@ -2394,6 +2511,10 @@ void OnMouseUp(int x, int y) {
             return;
         }
         if (OverUi((float)x, (float)y)) return;
+        if (g_pick.on) {  // picking: clicks copy the colour and never close the viewer
+            if (OverImage((float)x, (float)y)) CopyPickedColour(x, y, GetKeyState(VK_SHIFT) < 0);
+            return;
+        }
         if (!OverImage((float)x, (float)y)) Close();  // click on the dark background closes, like Picasa
         return;
     }
@@ -2448,6 +2569,10 @@ void OnDoubleClick(int x, int y) {
         OnMouseDown(x, y);
         return;
     }
+    if (g_pick.on) {
+        if (OverImage((float)x, (float)y)) CopyPickedColour(x, y, GetKeyState(VK_SHIFT) < 0);
+        return;
+    }
     Entry* e = Cur();
     if (!e || !e->info || !g_view.appeared) return;
     const double fit = FitZoom(*e);
@@ -2459,6 +2584,7 @@ void OnDoubleClick(int x, int y) {
 
 void KeyEscape(UINT) {
     if (g_helpOpen) ToggleHelp();
+    else if (g_pick.on) TogglePicker();
     else if (g_slideshow) ToggleSlideshow();
     else if (g_infoOpen) ToggleInfo();
     else Close();
@@ -2466,6 +2592,7 @@ void KeyEscape(UINT) {
 void KeyClose(UINT) { Close(); }
 void KeyInfo(UINT) { ToggleInfo(); }
 void KeyHelp(UINT) { ToggleHelp(); }
+void KeyPicker(UINT) { TogglePicker(); }
 void KeyDelete(UINT) { DeleteCurrent(); }
 void KeyUndo(UINT) { UndoDelete(); }
 void KeyCopy(UINT) { CopyCurrent(); }
@@ -2533,6 +2660,8 @@ const KeyDef kKeys[] = {
     {0, 0, 0, nullptr, L"Double-click", L"Fit / actual size"},
     {VK_UP, VK_UP, 0, KeyPan, L"↑   ↓", L"Pan when zoomed"},
     {VK_DOWN, VK_DOWN, 0, KeyPan, nullptr, nullptr},
+    {'P', 'P', 0, KeyPicker, L"P", L"Colour picker (click copies)"},
+    {0, 0, 0, nullptr, L"Shift+click", L"Copy as R, G, B"},
     {'R', 'R', M_SHIFT, KeyRotateLeft, L"R   Shift+R", L"Rotate right / left"},
     {'R', 'R', 0, KeyRotateRight, nullptr, nullptr},
     {'L', 'L', 0, KeyRotateLeft, nullptr, nullptr},
@@ -2612,8 +2741,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEHWHEEL: OnWheel(true, wp, lp); return 0;
         case WM_SETCURSOR:
             if (LOWORD(lp) == HTCLIENT) {
-                if (g_ui.target < 0.5 && !g_drag.active && !g_closing) SetCursor(nullptr);
+                if (g_ui.target < 0.5 && !g_drag.active && !g_closing && !g_pick.on) SetCursor(nullptr);
                 else if (g_hoverBtn != B_NONE || g_hoverThumb >= 0) SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                else if (g_pick.on && !g_drag.active && OverImage((float)g_lastMouse.x, (float)g_lastMouse.y))
+                    SetCursor(LoadCursorW(nullptr, IDC_CROSS));
                 else if (g_drag.active && !g_drag.swipe) SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
                 else SetCursor(LoadCursorW(nullptr, IDC_ARROW));
                 return TRUE;
