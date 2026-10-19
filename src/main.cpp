@@ -205,6 +205,7 @@ const double kMinZoomOfFit = 0.1;  // how far you can zoom out, relative to the 
 // Info panel (I), toast messages, pending deletes, touchpad gestures.
 bool g_infoOpen = false;
 Spring g_info{0.3, 0.92, 0.002};
+D2D1_RECT_F g_infoBox{};  // where the panel was last drawn, so clicks on it aren't clicks on the background
 std::wstring g_toastText;
 double g_toastUntil = 0;
 Spring g_toast{0.24, 1.0, 0.003};
@@ -302,6 +303,11 @@ std::wstring FileName(const std::wstring& p) {
 std::wstring DirName(const std::wstring& p) {
     size_t s = p.find_last_of(L"\\/");
     return s == std::wstring::npos ? L"." : p.substr(0, s);
+}
+
+// The folder's order: file names, with numbers compared as numbers (like Explorer).
+bool ByName(const std::wstring& a, const std::wstring& b) {
+    return StrCmpLogicalW(FileName(a).c_str(), FileName(b).c_str()) < 0;
 }
 
 // ---------------------------------------------------------------- device setup
@@ -1065,6 +1071,7 @@ int HitThumb(float x, float y) {
 }
 
 bool OverUi(float x, float y) {
+    if (g_infoOpen && g_info.x > 0.3 && InRect(g_infoBox, x, y)) return true;
     if (g_ui.x < 0.3) return false;
     if (HitButton(x, y) != B_NONE || InRect(ControlsPill(), x, y)) return true;
     return StripVisible() && InRect(StripPill(), x, y);
@@ -1582,6 +1589,7 @@ void DrawInfoPanel() {
     h += pad - gap;
 
     const D2D1_RECT_F box = D2D1::RectF(x, y, x + pw, y + h);
+    g_infoBox = box;
     Color(0.07f, 0.07f, 0.08f, 0.86f * a);
     g.ctx->FillRoundedRectangle(D2D1::RoundedRect(box, 14 * s, 14 * s), g.brush.get());
     Color(1, 1, 1, 0.08f * a);
@@ -1667,8 +1675,11 @@ void Render(bool hq) {
 }
 
 void ReleaseGpu() {
-    for (auto& kv : g_entries)
+    for (auto& kv : g_entries) {
         for (auto& b : kv.second.lv) b = Bmp();
+        kv.second.full = FullRes();
+        kv.second.anim.clear();
+    }
     g_ghosts.clear();
     g_view.shown = Bmp();
     g_view.prev = Bmp();
@@ -1770,10 +1781,7 @@ void ScanFolderAsync(const std::wstring& file) {
             } while (FindNextFileW(h, &fd));
             FindClose(h);
         }
-        std::sort(msg->files.begin(), msg->files.end(),
-                  [](const std::wstring& a, const std::wstring& b) {
-                      return StrCmpLogicalW(FileName(a).c_str(), FileName(b).c_str()) < 0;
-                  });
+        std::sort(msg->files.begin(), msg->files.end(), ByName);
         if (!PostMessageW(hwnd, WM_APP_LIST, 0, (LPARAM)msg)) delete msg;
     }).detach();
 }
@@ -1800,9 +1808,7 @@ void OnList(ListMsg* m) {
             break;
         }
     if (idx < 0) {  // opened something the folder scan didn't list; keep it in sequence
-        auto it = std::lower_bound(files.begin(), files.end(), g_curPath, [](const std::wstring& a, const std::wstring& b) {
-            return StrCmpLogicalW(FileName(a).c_str(), FileName(b).c_str()) < 0;
-        });
+        auto it = std::lower_bound(files.begin(), files.end(), g_curPath, ByName);
         idx = (int)(it - files.begin());
         files.insert(it, g_curPath);
     } else if (files[idx] != g_curPath) {  // same file, different case: keep our key
@@ -2023,9 +2029,7 @@ void OnRecycled(bool ok, std::wstring* path) {
     }
     // Couldn't delete (in use, read-only, gone offline...): put it back where it belongs.
     if (!g_closing && !g_fileIndex.count(*p) && GetFileAttributesW(p->c_str()) != INVALID_FILE_ATTRIBUTES) {
-        auto it = std::lower_bound(g_files.begin(), g_files.end(), *p, [](const std::wstring& a, const std::wstring& b) {
-            return StrCmpLogicalW(FileName(a).c_str(), FileName(b).c_str()) < 0;
-        });
+        auto it = std::lower_bound(g_files.begin(), g_files.end(), *p, ByName);
         const int idx = (int)(it - g_files.begin());
         g_files.insert(it, *p);
         if (idx <= g_cur) g_cur++;

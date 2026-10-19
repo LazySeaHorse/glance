@@ -65,7 +65,7 @@ Photos tagged with a wide-gamut colour profile are converted to sRGB as they're 
 2. **Something sharp-enough appears first.** Most camera JPEGs carry a small preview inside the file; Glance shows that instantly, then crossfades to the real decode a moment later. For large JPEGs it asks the decoder to decode at 1/2, 1/4 or 1/8 size directly (much faster than decoding full size and shrinking).
 3. **It decodes for your screen, not for the file.** A 24-megapixel photo is decoded at screen resolution; full resolution is only decoded when you zoom past that.
 4. **Neighbours are preloaded.** The next two photos in the direction you're browsing (and the previous ones) are decoded in the background, so arrow keys feel instant. Filmstrip thumbnails load after those.
-5. **Everything is drawn on the GPU** (Direct2D on Direct3D 11) through DirectComposition, so the dimmed desktop behind the photo is live and transparent rather than a screenshot.
+5. **Everything is drawn on the GPU** (Direct2D on Direct3D 11) through DirectComposition, so the dimmed desktop behind the photo is live and transparent rather than a screenshot (a video playing underneath keeps playing).
 6. **Nothing runs when nothing moves.** The render loop sleeps between interactions (0% CPU while you look at a photo) and, while animating, wakes on your display's refresh and samples every motion at the moment the frame will be shown.
 7. **A second launch costs nothing.** If Glance is already open, a new launch just passes the file to it and exits.
 8. **The filmstrip borrows Explorer's thumbnails.** If Explorer has shown a folder before, Windows already has thumbnails for it on disk; Glance asks for those first and only decodes photos Windows hasn't seen.
@@ -140,9 +140,19 @@ Set the environment variable `GLANCE_TRACE=1` (or pass `--trace`) and Glance app
 
 It was built and exercised under Wine on Linux, which can't show DirectComposition or vsync timing, so these need a check on your PC:
 
-- The live transparent backdrop (Wine only exercised the screenshot fallback; `--no-composition` forces that path for comparison).
 - Animation smoothness at your monitor's refresh rate, and open-to-first-pixel time.
-- HEIC and RAW orientation: Glance assumes the Windows HEIF decoder already rotates pixels itself. If HEIC photos appear sideways, that assumption is wrong.
+- RAW orientation: Glance assumes the Windows decoder already rotates pixels itself. If RAW photos appear sideways, that assumption is wrong.
 - Colour management: Wine doesn't implement colour profiles, so this was only checked by reading the code. A Display P3 or Adobe RGB photo should look the same as in the Windows Photos app.
 - High-DPI (125–200%) layout of the controls and filmstrip.
-- Real precision-touchpad gestures (tested by replaying the messages a touchpad sends) and the Windows thumbnail cache (Wine doesn't provide one).
+- The Windows thumbnail cache (Wine doesn't provide one).
+- Touchpad two-finger sideways swipe: see below.
+
+## Verified on real Windows
+
+- HEIC photos open correctly (with the HEIF Image Extensions installed).
+- The live transparent backdrop works, and video playing underneath it keeps playing.
+- Precision touchpad: pinch to zoom and two-finger up/down panning work.
+
+### Known issue
+
+On a precision touchpad, the two-finger sideways swipe between photos only starts working after another gesture (a pinch or an up/down scroll) has happened, and again after each photo change. Pinch and vertical scroll are unaffected.
