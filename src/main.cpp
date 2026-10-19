@@ -171,7 +171,7 @@ Entry* Find(const std::wstring& p) {
 }
 Entry* Cur() { return g_curPath.empty() ? nullptr : &Ent(g_curPath); }
 
-enum AppearMode { APPEAR_OPEN, APPEAR_SLIDE, APPEAR_FADE };
+enum AppearMode { APPEAR_OPEN, APPEAR_SLIDE, APPEAR_FADE, APPEAR_CUT };
 
 struct View {
     Spring zoom{0.32, 0.9, 1e-4}, panX{0.32, 0.9, 0.2}, panY{0.32, 0.9, 0.2};
@@ -219,6 +219,7 @@ struct PendingDelete {
 };
 std::vector<PendingDelete> g_pendingDel;  // hidden now, recycled after a grace period (undoable until then)
 const double kDeleteGrace = 6.0;
+const int kJumpCount = 10;  // the number keys 1-9 and 0 jump to the first ten photos
 struct Touchpad {
     bool seenSmallH = false;  // has sent sub-notch horizontal scrolls: a precision touchpad
     bool swiping = false;
@@ -580,6 +581,13 @@ void RequestDecodes() {
             add(g_files[i], LV_THUMB, 100 + d, false, false, true);  // Windows' thumbnail cache first
         }
     }
+    // The first ten are what the number keys jump to: have something to show at once.
+    for (int i = 0; i < std::min(n, kJumpCount); i++) {
+        if (std::abs(i - g_cur) <= 40) continue;  // already asked for above
+        Entry* te = Find(g_files[i]);
+        if (te && (te->failed || te->thumbFailed || te->lv[0].b || te->lv[1].b)) continue;
+        add(g_files[i], LV_THUMB, 200 + i, false, false, true);
+    }
     g_loader.setRequests(std::move(rq));
 }
 
@@ -590,7 +598,7 @@ void Evict() {
         if (d > 0) kv.second.full = FullRes();
         if (d > 1) kv.second.anim.clear();
         if (d > 3) kv.second.lv[1] = Bmp();
-        if (d > 90) kv.second.lv[0] = Bmp();
+        if (d > 90 && !(it != g_fileIndex.end() && it->second < kJumpCount)) kv.second.lv[0] = Bmp();
     }
 }
 
@@ -658,6 +666,11 @@ void TryAppear() {
             v.offX.snap(0);
             v.alpha.params(0.9, 1.0);  // slow crossfade
             v.alpha.snap(0);
+            v.scale.snap(1.0);
+            break;
+        case APPEAR_CUT:  // no transition: it's simply there
+            v.offX.snap(0);
+            v.alpha.snap(1);
             v.scale.snap(1.0);
             break;
     }
@@ -753,10 +766,16 @@ void Navigate(int idx, int mode) {
         ReleaseCapture();
         g_releasing = false;
     }
-    Trace(L"navigate %d -> %d (%ls)", g_cur, idx, mode == APPEAR_SLIDE ? L"slide" : L"fade");
+    Trace(L"navigate %d -> %d (%ls)", g_cur, idx,
+          mode == APPEAR_SLIDE ? L"slide" : mode == APPEAR_CUT ? L"cut" : L"fade");
     int dir = idx > g_cur ? 1 : -1;
     if (mode == APPEAR_FADE) dir = 1;
-    PushGhost(dir, mode == APPEAR_SLIDE);
+    if (mode == APPEAR_CUT) {
+        g_ghosts.clear();
+        g_stripSnapped = false;  // the filmstrip jumps too
+    } else {
+        PushGhost(dir, mode == APPEAR_SLIDE);
+    }
     g_prevDir = dir;
     g_cur = idx;
     g_curPath = g_files[idx];
@@ -2380,6 +2399,13 @@ void KeyPrev(UINT) {
     g_slideshow = false;
     Navigate(g_cur - 1, APPEAR_SLIDE);
 }
+void KeyJump(UINT vk) {
+    const int digit = vk >= VK_NUMPAD0 ? vk - VK_NUMPAD0 : vk - '0';
+    const int idx = (digit + 9) % 10;  // 1 is the first photo, 0 the tenth
+    if (idx >= (int)g_files.size()) return;
+    g_slideshow = false;
+    Navigate(idx, APPEAR_CUT);
+}
 void KeyFirst(UINT) { Navigate(0, APPEAR_SLIDE); }
 void KeyLast(UINT) { Navigate((int)g_files.size() - 1, APPEAR_SLIDE); }
 void KeyPan(UINT vk) {
@@ -2407,6 +2433,8 @@ const KeyDef kKeys[] = {
     {VK_LEFT, VK_LEFT, 0, KeyPrev, L"←   Backspace   Page Up", L"Previous photo"},
     {VK_PRIOR, VK_PRIOR, 0, KeyPrev, nullptr, nullptr},
     {VK_BACK, VK_BACK, 0, KeyPrev, nullptr, nullptr},
+    {'0', '9', 0, KeyJump, L"1 – 9   0", L"Jump to photo 1 – 10, no animation"},
+    {VK_NUMPAD0, VK_NUMPAD9, 0, KeyJump, nullptr, nullptr},
     {VK_HOME, VK_HOME, 0, KeyFirst, L"Home", L"First photo"},
     {VK_END, VK_END, 0, KeyLast, L"End", L"Last photo"},
     {VK_F5, VK_F5, 0, KeySlideshow, L"S   F5", L"Slideshow"},
