@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "com.h"
+#include "fileops.h"
 #include "loader.h"
 #include "spring.h"
 #include "version.h"
@@ -44,6 +45,8 @@ namespace {
 
 constexpr UINT WM_APP_DECODED = WM_APP + 1;
 constexpr UINT WM_APP_LIST = WM_APP + 2;
+constexpr UINT WM_APP_COPIED = WM_APP + 3;    // lParam: ClipData* ready to go on the clipboard
+constexpr UINT WM_APP_RECYCLED = WM_APP + 4;  // wParam: success, lParam: std::wstring* path
 constexpr UINT_PTR TIMER_TICK = 1;
 const wchar_t* kAppName = L"Glance";
 constexpr ULONG_PTR kCopyDataOpen = 0x474C4E43;  // 'GLNC
@@ -101,7 +104,7 @@ struct Gfx {
 
     ComPtr<ID2D1SolidColorBrush> brush;
     ComPtr<IDWriteFactory> dw;
-    ComPtr<IDWriteTextFormat> font, fontBig;
+    ComPtr<IDWriteTextFormat> font, fontBig, fontSmall, fontSmallBold;
     ComPtr<ID2D1StrokeStyle> round;
     ComPtr<ID2D1PathGeometry> icPrev, icNext, icPlay, icPause, icClose, icRot;
 
@@ -117,6 +120,21 @@ Gfx g;
 struct Bmp {
     ComPtr<ID2D1Bitmap1> b;
     int w = 0, h = 0;
+    bool upright = false;  // already in display orientation (Windows thumbnail cache)
+};
+
+// Full resolution, as tiles (see kTile/kGutter in loader.h).
+struct Tile {
+    Bmp b;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // the part this tile owns, in full-level pixels
+    int gl = 0, gt = 0;                  // where that part starts inside the bitmap (after the gutter)
+    double at = 0;                       // arrival time, for a short fade-in
+};
+struct FullRes {
+    int lw = 0, lh = 0;  // size of the full level
+    std::vector<Tile> tiles;
+    bool started = false, complete = false;
+    double lastAt = -1;
 };
 
 // ---------------------------------------------------------------- model
@@ -129,6 +147,9 @@ struct Entry {
     std::vector<Bmp> anim;   // animated GIF frames (screen-fit size)
     std::vector<int> delays;  // ms per frame
     double thumbAt = -1;      // when a filmstrip picture first became available (fade-in)
+    FullRes full;
+    std::vector<std::pair<std::wstring, std::wstring>> meta;  // photo info panel
+    bool metaDone = false;
     int userRot = 0;  // quarter turns, view only
 };
 
@@ -180,6 +201,25 @@ Spring g_stripK{0.24, 0.92, 0.002};   // filmstrip scale: compact <-> full, foll
 bool g_stripSnapped = false;
 const float kBgAlpha = 0.88f;
 const double kMinZoomOfFit = 0.1;  // how far you can zoom out, relative to the fitted size
+
+// Info panel (I), toast messages, pending deletes, touchpad gestures.
+bool g_infoOpen = false;
+Spring g_info{0.3, 0.92, 0.002};
+std::wstring g_toastText;
+double g_toastUntil = 0;
+Spring g_toast{0.24, 1.0, 0.003};
+struct PendingDelete {
+    std::wstring path;
+    int index;
+    double at;
+};
+std::vector<PendingDelete> g_pendingDel;  // hidden now, recycled after a grace period (undoable until then)
+const double kDeleteGrace = 6.0;
+struct Touchpad {
+    bool seenSmallH = false;  // has sent sub-notch horizontal scrolls: a precision touchpad
+    bool swiping = false;
+    double lastEvent = 0, lockUntil = 0;
+} g_tp;
 
 int g_animIdx = 0;
 double g_animNext = 0;
@@ -419,6 +459,10 @@ void InitStatic() {
                                DWRITE_FONT_STRETCH_NORMAL, 13.5f * g.s, L"en-us", g.font.put());
         g.dw->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_SEMI_LIGHT, DWRITE_FONT_STYLE_NORMAL,
                                DWRITE_FONT_STRETCH_NORMAL, 20.0f * g.s, L"en-us", g.fontBig.put());
+        g.dw->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                               DWRITE_FONT_STRETCH_NORMAL, 12.5f * g.s, L"en-us", g.fontSmall.put());
+        g.dw->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                               DWRITE_FONT_STRETCH_NORMAL, 14.0f * g.s, L"en-us", g.fontSmallBold.put());
         if (g.font) g.font->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         if (g.fontBig) {
             g.fontBig->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -456,48 +500,58 @@ void InitStatic() {
 
 // ---------------------------------------------------------------- decoding requests
 
-Bmp Upload(const std::vector<uint8_t>& px, int w, int h) {
+Bmp UploadRaw(const uint8_t* px, int w, int h, int pitch) {
     Bmp out;
-    if (px.empty() || w <= 0 || h <= 0) return out;
+    if (!px || w <= 0 || h <= 0) return out;
     D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    if (SUCCEEDED(g.ctx->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, &bp, out.b.put()))) {
+    if (SUCCEEDED(g.ctx->CreateBitmap(D2D1::SizeU(w, h), px, pitch, &bp, out.b.put()))) {
         out.w = w;
         out.h = h;
     }
     return out;
 }
 
+Bmp Upload(const std::vector<uint8_t>& px, int w, int h, bool upright = false) {
+    if (px.size() < (size_t)w * h * 4) return Bmp();
+    Bmp b = UploadRaw(px.data(), w, h, w * 4);
+    b.upright = upright;
+    return b;
+}
+
 bool NeedFull(const Entry& e) {
-    if (!e.info || e.failed || e.fullFailed || !e.anim.empty()) return false;
-    if (e.lv[2].b) return false;
+    if (!e.info || e.failed || e.fullFailed || !e.anim.empty() || e.full.complete) return false;
+    if (e.full.started) return true;  // keep going once begun, even if you zoom back out
     const Bmp& fit = e.lv[1];
-    if (!fit.b) return false;
-    if (fit.w >= e.w || fit.w >= (int)g.maxBitmap) return false;  // already full-res (or capped)
+    if (!fit.b || fit.upright) return false;
+    if (fit.w >= e.w) return false;  // the screen-sized decode already is full resolution
     return e.w * g_view.zoom.target > fit.w * 1.03;
 }
 
 void RequestDecodes() {
     if (g_files.empty()) return;
     std::vector<DecodeRequest> rq;
-    auto add = [&](const std::wstring& p, int lv, int prio, bool fast, bool wantThumb) {
+    auto add = [&](const std::wstring& p, int lv, int prio, bool fast, bool wantThumb, bool shell = false) {
         DecodeRequest r;
         r.path = p;
         r.level = lv;
         r.priority = prio;
         r.fastOnly = fast;
         r.wantThumb = wantThumb;
+        r.shellFirst = shell;
         if (lv == LV_THUMB) r.boxW = r.boxH = 320;
         else if (lv == LV_FIT) { r.boxW = g.W; r.boxH = g.H; }
-        else r.boxW = r.boxH = (int)g.maxBitmap;
+
         rq.push_back(std::move(r));
     };
     Entry& e = Ent(g_curPath);
     if (!e.failed) {
-        if (!e.lv[0].b && !e.lv[1].b && !e.noFastThumb) add(g_curPath, LV_THUMB, 0, true, false);
+        // Header + embedded preview first: it gives the size/rotation needed to show anything.
+        if ((!e.info || (!e.lv[0].b && !e.lv[1].b)) && !e.noFastThumb) add(g_curPath, LV_THUMB, 0, true, false);
         if (!e.lv[1].b) add(g_curPath, LV_FIT, 1, false, !e.lv[0].b);
         if (NeedFull(e)) add(g_curPath, LV_FULL, 2, false, false);
     }
+    if (g_infoOpen && !e.metaDone) add(g_curPath, LV_META, 3, false, false);
     const int n = (int)g_files.size();
     const int order[] = {1, -1, 2, -2, 3};
     int prio = 10;
@@ -514,7 +568,7 @@ void RequestDecodes() {
             if (i < 0 || i >= n) continue;
             Entry* te = Find(g_files[i]);
             if (te && (te->failed || te->thumbFailed || te->lv[0].b || te->lv[1].b)) continue;
-            add(g_files[i], LV_THUMB, 100 + d, false, false);
+            add(g_files[i], LV_THUMB, 100 + d, false, false, true);  // Windows' thumbnail cache first
         }
     }
     g_loader.setRequests(std::move(rq));
@@ -524,7 +578,7 @@ void Evict() {
     for (auto& kv : g_entries) {
         auto it = g_fileIndex.find(kv.first);
         int d = it == g_fileIndex.end() ? (kv.first == g_curPath ? 0 : 1 << 20) : std::abs(it->second - g_cur);
-        if (d > 0) kv.second.lv[2] = Bmp();
+        if (d > 0) kv.second.full = FullRes();
         if (d > 1) kv.second.anim.clear();
         if (d > 3) kv.second.lv[1] = Bmp();
         if (d > 90) kv.second.lv[0] = Bmp();
@@ -534,7 +588,7 @@ void Evict() {
 // ---------------------------------------------------------------- view state
 
 const Bmp* AnyBitmap(const Entry& e) {
-    for (int lv : {1, 2, 0})
+    for (int lv : {1, 0})
         if (e.lv[lv].b) return &e.lv[lv];
     return nullptr;
 }
@@ -791,10 +845,70 @@ void SlideshowTick() {
 
 // ---------------------------------------------------------------- results
 
+// A band of full-resolution rows arrived: cut it into tiles.
+void AddBand(Entry& e, const DecodeResult& r) {
+    FullRes& f = e.full;
+    if (r.coreY0 == 0 || f.lw != r.levelW || f.lh != r.levelH) {  // a (re)start
+        f = FullRes();
+        f.lw = r.levelW;
+        f.lh = r.levelH;
+        f.started = true;
+    }
+    const int pitch = r.levelW * 4;
+    if (r.pixels.size() < (size_t)pitch * r.bufRows) return;
+    const double now = Now();
+    for (int x0 = 0; x0 < r.levelW; x0 += kTile) {
+        const int x1 = std::min(r.levelW, x0 + kTile);
+        const int gl = std::min(kGutter, x0), gr = std::min(kGutter, r.levelW - x1);
+        Tile t;
+        t.b = UploadRaw(r.pixels.data() + (size_t)(x0 - gl) * 4, (x1 - x0) + gl + gr, r.bufRows, pitch);
+        if (!t.b.b) {  // out of GPU memory: give up on full resolution, keep the screen-sized picture
+            f = FullRes();
+            e.fullFailed = true;
+            return;
+        }
+        t.x0 = x0;
+        t.x1 = x1;
+        t.y0 = r.coreY0;
+        t.y1 = r.coreY1;
+        t.gl = gl;
+        t.gt = r.coreY0 - r.bufY0;
+        t.at = now;
+        f.tiles.push_back(std::move(t));
+    }
+    f.lastAt = now;
+}
+
 void ProcessResults() {
     bool curChanged = false;
     for (auto& r : g_loader.takeResults()) {
         Entry& e = Ent(r.path);
+        const bool isCur = r.path == g_curPath;
+
+        if (r.level == LV_FULL) {  // streamed full resolution: only useful for the photo on screen
+            if (!isCur) continue;
+            if (r.band) {
+                AddBand(e, r);
+                g.needsRedraw = true;
+                continue;
+            }
+            if (r.ok && e.full.started) e.full.complete = true;
+            else if (!r.ok) {
+                e.full = FullRes();
+                e.fullFailed = true;
+            }
+            Trace(L"full resolution of %ls: %ls (%d tiles) in %.1f ms", FileName(r.path).c_str(),
+                  r.ok ? L"done" : L"failed", (int)e.full.tiles.size(), r.ms);
+            curChanged = true;
+            continue;
+        }
+        if (r.level == LV_META) {
+            e.meta = std::move(r.meta);
+            e.metaDone = true;
+            if (isCur) g.needsRedraw = true;
+            continue;
+        }
+
         if (r.infoOk) {
             if (!e.info || e.w != r.imgW || e.h != r.imgH || e.orient != r.orientation) g_stripDirty = true;
             e.info = true;
@@ -806,10 +920,10 @@ void ProcessResults() {
             e.failed = true;
             g_stripDirty = true;
         }
-        const bool hadPicture = e.lv[0].b || e.lv[1].b || e.lv[2].b;
+        const bool hadPicture = e.lv[0].b || e.lv[1].b;
         bool ok = r.ok;
         if (ok) {
-            Bmp b = Upload(r.pixels, r.pxW, r.pxH);
+            Bmp b = Upload(r.pixels, r.pxW, r.pxH, r.upright);
             ok = (bool)b.b;
             if (ok) e.lv[r.level] = std::move(b);
         }
@@ -824,16 +938,15 @@ void ProcessResults() {
                 }
                 e.anim.push_back(std::move(fb));
             }
-            if (r.path == g_curPath) RestartAnimation();
+            if (isCur) RestartAnimation();
         }
         if (!ok && r.infoOk) {  // decodable header but these pixels didn't make it
             if (r.level == LV_THUMB) (r.infoOnly ? e.noFastThumb : e.thumbFailed) = true;
-            else if (r.level == LV_FIT) e.failed = true;
-            else e.fullFailed = true;  // e.g. too big for memory: keep showing the screen-sized version
+            else e.failed = true;
         }
-        if (!r.thumb.empty() && !e.lv[0].b) e.lv[0] = Upload(r.thumb, r.thW, r.thH);
-        if (!hadPicture && (e.lv[0].b || e.lv[1].b || e.lv[2].b) && e.thumbAt < 0) e.thumbAt = Now();
-        if (r.path == g_curPath) {
+        if (!r.thumb.empty() && (!e.lv[0].b || e.lv[0].upright)) e.lv[0] = Upload(r.thumb, r.thW, r.thH);
+        if (!hadPicture && (e.lv[0].b || e.lv[1].b) && e.thumbAt < 0) e.thumbAt = Now();
+        if (isCur) {
             curChanged = true;
             Trace(L"decoded %ls level %d (%dx%d) in %.1f ms", FileName(r.path).c_str(), r.level, r.pxW, r.pxH, r.ms);
             if (r.level == LV_FIT && r.ok && !g_tracedFit) {
@@ -1028,6 +1141,25 @@ bool Update(double dt) {
         }
     }
 
+    g_toast.target = (Now() < g_toastUntil && !g_closing) ? 1 : 0;
+    anim |= g_toast.step(dt);
+    g_info.target = g_infoOpen ? 1 : 0;
+    anim |= g_info.step(dt);
+
+    // two-finger swipe on a touchpad: when the fingers stop without passing
+    // the threshold, ease back
+    if (g_tp.swiping) {
+        anim = true;
+        if (Now() - g_tp.lastEvent > 0.12) {
+            g_tp.swiping = false;
+            g_view.offX.params(0.38, 0.82);
+            g_view.offX.target = 0;
+        }
+    }
+
+    // full-resolution tiles fading in
+    if (e && Now() - e->full.lastAt < 0.2) anim = true;
+
     // loading spinner while the current photo hasn't arrived yet
     if (!v.appeared && e && !e->failed && Now() - v.navTime > 0.2) anim = true;
 
@@ -1063,27 +1195,50 @@ void UpdateUiTarget() {
 
 void Color(float r, float gg, float b, float a) { g.brush->SetColor(D2D1::ColorF(r, gg, b, a)); }
 
-void DrawImage(const Bmp& b, int imgW, int imgH, int orient, double rotDeg, double zoom, double cx, double cy,
-               float alpha, bool hq) {
-    if (!b.b || alpha <= 0.002f || imgW <= 0 || imgH <= 0) return;
-    const int q = OrientQuarter(orient);
-    const bool flip = OrientFlip(orient);
+// Where a photo goes on screen. Local coordinates are the stored pixels,
+// centred on the origin; the matrix applies EXIF orientation, the user's
+// rotation, zoom and position.
+struct ImageXf {
+    D2D1::Matrix3x2F m;
+    bool aligned = true;  // a multiple of 90 degrees (not mid-rotation)
+    int w = 0, h = 0;     // local rectangle size
+};
+
+ImageXf PhotoTransform(int imgW, int imgH, int orient, bool upright, double rotDeg, double zoom, double cx, double cy,
+                       bool hq) {
+    ImageXf x;
+    int q = OrientQuarter(orient);
+    bool flip = OrientFlip(orient);
+    if (upright) {  // pixels already turned: only the user's rotation applies
+        if (q & 1) std::swap(imgW, imgH);
+        q = 0;
+        flip = false;
+    }
     const double ang = q * 90.0 + rotDeg;
     const double rem = std::fmod(std::fabs(ang), 90.0);
-    const bool aligned = rem < 0.01 || rem > 89.99;
-    if (hq && aligned) {  // pixel-align the top-left corner when nothing moves
+    x.aligned = rem < 0.01 || rem > 89.99;
+    if (hq && x.aligned) {  // pixel-align the top-left corner when nothing moves
         const bool swap = ((int)std::lround(ang / 90.0)) & 1;
         const double dw = (swap ? imgH : imgW) * zoom, dh = (swap ? imgW : imgH) * zoom;
         cx = std::round(cx - dw / 2) + dw / 2;
         cy = std::round(cy - dh / 2) + dh / 2;
     }
-    const D2D1::Matrix3x2F m = D2D1::Matrix3x2F::Scale(flip ? -1.f : 1.f, 1.f) *
-                               D2D1::Matrix3x2F::Rotation((float)ang) *
-                               D2D1::Matrix3x2F::Scale((float)zoom, (float)zoom) *
-                               D2D1::Matrix3x2F::Translation((float)cx, (float)cy);
-    g.ctx->SetTransform(m);
+    x.m = D2D1::Matrix3x2F::Scale(flip ? -1.f : 1.f, 1.f) * D2D1::Matrix3x2F::Rotation((float)ang) *
+          D2D1::Matrix3x2F::Scale((float)zoom, (float)zoom) * D2D1::Matrix3x2F::Translation((float)cx, (float)cy);
+    x.w = imgW;
+    x.h = imgH;
+    return x;
+}
+
+void DrawImage(const Bmp& b, int imgW, int imgH, int orient, double rotDeg, double zoom, double cx, double cy,
+               float alpha, bool hq) {
+    if (!b.b || alpha <= 0.002f || imgW <= 0 || imgH <= 0) return;
+    const ImageXf x = PhotoTransform(imgW, imgH, orient, b.upright, rotDeg, zoom, cx, cy, hq);
+    imgW = x.w;
+    imgH = x.h;
+    g.ctx->SetTransform(x.m);
     const D2D1_RECT_F dst = D2D1::RectF(-imgW / 2.f, -imgH / 2.f, imgW / 2.f, imgH / 2.f);
-    if (aligned) {
+    if (x.aligned) {
         D2D1_INTERPOLATION_MODE im = D2D1_INTERPOLATION_MODE_LINEAR;
         if (hq) im = g.hqOk ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC : D2D1_INTERPOLATION_MODE_CUBIC;
         else if (zoom * imgW < b.w * 0.75) im = D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR;
@@ -1099,6 +1254,43 @@ void DrawImage(const Bmp& b, int imgW, int imgH, int orient, double rotDeg, doub
             br->SetOpacity(alpha);
             g.ctx->FillRectangle(dst, br.get());
         }
+    }
+    g.ctx->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
+// Full-resolution tiles over the screen-sized picture. Only tiles that touch
+// the screen are drawn; each fades in as it arrives.
+void DrawTiles(const Entry& e, double rotDeg, double zoom, double cx, double cy, float alpha, bool hq) {
+    const FullRes& f = e.full;
+    if (f.tiles.empty() || f.lw <= 0 || f.lh <= 0) return;
+    const ImageXf x = PhotoTransform(e.w, e.h, e.orient, false, rotDeg, zoom, cx, cy, hq);
+    if (!x.aligned) return;  // mid-rotation: the screen-sized picture is enough
+    const float sx = (float)e.w / f.lw, sy = (float)e.h / f.lh;
+    const float ox = -e.w / 2.f, oy = -e.h / 2.f;
+    const bool shrinking = zoom * sx < 0.75;  // drawn well below full resolution
+    const D2D1_INTERPOLATION_MODE im = hq ? (g.hqOk ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+                                                    : D2D1_INTERPOLATION_MODE_CUBIC)
+                                          : (shrinking ? D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR
+                                                       : D2D1_INTERPOLATION_MODE_LINEAR);
+    const double now = Now();
+    g.ctx->SetTransform(x.m);
+    for (const Tile& t : f.tiles) {
+        const D2D1_RECT_F dst = D2D1::RectF(ox + t.x0 * sx, oy + t.y0 * sy, ox + t.x1 * sx, oy + t.y1 * sy);
+        // cull: transform the corners to the screen
+        float l = 1e9f, tp = 1e9f, r = -1e9f, bt = -1e9f;
+        for (D2D1_POINT_2F c : {D2D1::Point2F(dst.left, dst.top), D2D1::Point2F(dst.right, dst.top),
+                                D2D1::Point2F(dst.left, dst.bottom), D2D1::Point2F(dst.right, dst.bottom)}) {
+            const D2D1_POINT_2F sp = x.m.TransformPoint(c);
+            l = std::min(l, sp.x);
+            r = std::max(r, sp.x);
+            tp = std::min(tp, sp.y);
+            bt = std::max(bt, sp.y);
+        }
+        if (r < 0 || bt < 0 || l > g.W || tp > g.H) continue;
+        const float fade = (float)std::clamp((now - t.at) / 0.15, 0.0, 1.0);
+        const D2D1_RECT_F src = D2D1::RectF((float)t.gl, (float)t.gt, (float)(t.gl + t.x1 - t.x0),
+                                            (float)(t.gt + t.y1 - t.y0));
+        g.ctx->DrawBitmap(t.b.b.get(), &dst, alpha * fade, im, &src, nullptr);
     }
     g.ctx->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -1132,6 +1324,8 @@ void DrawCurrent(bool hq) {
     } else {
         DrawImage(*b, e->w, e->h, e->orient, v.rot.x, z, cx, cy, a, still);
     }
+    // Zoomed past the screen-sized picture: lay the sharp tiles on top.
+    if (!e->full.tiles.empty() && e->w * z > b->w * 1.03) DrawTiles(*e, v.rot.x, z, cx, cy, a, still);
 }
 
 void DrawGhosts() {
@@ -1166,14 +1360,14 @@ void DrawLabel(const std::wstring& text, IDWriteTextFormat* fmt, float x, float 
 }
 
 void DrawThumb(const Entry& e, const D2D1_RECT_F& r, float a, bool hq) {
-    const Bmp* b = e.lv[0].b ? &e.lv[0] : (e.lv[1].b ? &e.lv[1] : (e.lv[2].b ? &e.lv[2] : nullptr));
+    const Bmp* b = e.lv[0].b ? &e.lv[0] : (e.lv[1].b ? &e.lv[1] : nullptr);
     if (!b) {
         Color(1, 1, 1, 0.08f * a);
         g.ctx->FillRectangle(r, g.brush.get());
         return;
     }
-    const int q = (OrientQuarter(e.orient) + e.userRot) & 3;
-    const bool flip = OrientFlip(e.orient);
+    const int q = ((b->upright ? 0 : OrientQuarter(e.orient)) + e.userRot) & 3;
+    const bool flip = !b->upright && OrientFlip(e.orient);
     const float rw = r.right - r.left, rh = r.bottom - r.top;
     const float dw = (q & 1) ? rh : rw, dh = (q & 1) ? rw : rh;
     D2D1_RECT_F src;
@@ -1207,7 +1401,8 @@ void DrawUi(bool hq) {
         swprintf(buf, 160, L"     %d / %d", g_cur + 1, (int)g_files.size());
         t += buf;
         if (e->info) {
-            swprintf(buf, 160, L"     %d × %d", e->w, e->h);
+            const bool sideways = OrientQuarter(e->orient) & 1;  // the size as shown
+            swprintf(buf, 160, L"     %d × %d", sideways ? e->h : e->w, sideways ? e->w : e->h);
             t += buf;
         }
         if (g_view.appeared && (!g_view.fitted || !g_view.zoom.settled())) {
@@ -1306,6 +1501,109 @@ void DrawUi(bool hq) {
     }
 }
 
+// ---------------------------------------------------------------- toast & info panel
+
+void ShowToast(const std::wstring& text, double seconds) {
+    g_toastText = text;
+    g_toastUntil = Now() + seconds;
+    g.needsRedraw = true;
+}
+
+ComPtr<IDWriteTextLayout> Layout(const std::wstring& text, IDWriteTextFormat* fmt, float maxW, bool wrap) {
+    ComPtr<IDWriteTextLayout> lay;
+    if (!fmt || !g.dw || FAILED(g.dw->CreateTextLayout(text.c_str(), (UINT32)text.size(), fmt, maxW, 4000.f, lay.put())))
+        return {};
+    lay->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+    return lay;
+}
+
+float LayoutWidth(IDWriteTextLayout* l) {
+    DWRITE_TEXT_METRICS m{};
+    if (l) l->GetMetrics(&m);
+    return m.widthIncludingTrailingWhitespace;
+}
+float LayoutHeight(IDWriteTextLayout* l) {
+    DWRITE_TEXT_METRICS m{};
+    if (l) l->GetMetrics(&m);
+    return m.height;
+}
+
+void DrawToast() {
+    const float a = (float)std::clamp(g_toast.x, 0.0, 1.0);
+    if (a < 0.003f || g_toastText.empty()) return;
+    const float s = g.s;
+    auto lay = Layout(g_toastText, g.font.get(), (float)g.W, false);
+    if (!lay) return;
+    const float tw = LayoutWidth(lay.get()), th = LayoutHeight(lay.get());
+    const float padX = 18 * s, padY = 10 * s;
+    const float bottom = ControlsPill().top - 14 * s + (1 - a) * 8 * s;
+    const D2D1_RECT_F r = D2D1::RectF(g.W / 2.f - tw / 2 - padX, bottom - th - 2 * padY, g.W / 2.f + tw / 2 + padX, bottom);
+    Color(0.08f, 0.08f, 0.09f, 0.82f * a);
+    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(r, (r.bottom - r.top) / 2, (r.bottom - r.top) / 2), g.brush.get());
+    Color(1, 1, 1, 0.95f * a);
+    g.ctx->DrawTextLayout(D2D1::Point2F(r.left + padX, r.top + padY), lay.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+}
+
+void DrawInfoPanel() {
+    const float a = (float)std::clamp(g_info.x, 0.0, 1.0) * (float)std::clamp(g_bg.x, 0.0, 1.0);
+    if (a < 0.003f) return;
+    Entry* e = Cur();
+    if (!e) return;
+    const float s = g.s;
+    const float pw = 330 * s, pad = 18 * s, labelW = 92 * s, gap = 9 * s;
+    const float x = g.W - 24 * s - pw + (1 - (float)g_info.x) * 28 * s;
+    const float y = 72 * s;
+    const float valueW = pw - 2 * pad - labelW;
+
+    struct Row {
+        ComPtr<IDWriteTextLayout> label, value;
+        float h;
+    };
+    std::vector<Row> rows;
+    auto title = Layout(FileName(g_curPath), g.fontSmallBold.get(), pw - 2 * pad, true);
+    float h = pad + LayoutHeight(title.get()) + 12 * s;
+    if (!e->metaDone) {
+        Row r{{}, Layout(L"Reading…", g.fontSmall.get(), valueW, true), 0};
+        r.h = LayoutHeight(r.value.get());
+        rows.push_back(std::move(r));
+    } else if (e->meta.empty()) {
+        Row r{{}, Layout(L"No details available", g.fontSmall.get(), valueW, true), 0};
+        r.h = LayoutHeight(r.value.get());
+        rows.push_back(std::move(r));
+    }
+    for (auto& kv : e->meta) {
+        Row r;
+        r.label = Layout(kv.first, g.fontSmall.get(), labelW - 8 * s, true);
+        r.value = Layout(kv.second, g.fontSmall.get(), valueW, true);
+        r.h = std::max(LayoutHeight(r.label.get()), LayoutHeight(r.value.get()));
+        rows.push_back(std::move(r));
+    }
+    for (auto& r : rows) h += r.h + gap;
+    h += pad - gap;
+
+    const D2D1_RECT_F box = D2D1::RectF(x, y, x + pw, y + h);
+    Color(0.07f, 0.07f, 0.08f, 0.86f * a);
+    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(box, 14 * s, 14 * s), g.brush.get());
+    Color(1, 1, 1, 0.08f * a);
+    g.ctx->DrawRoundedRectangle(D2D1::RoundedRect(box, 14 * s, 14 * s), g.brush.get(), 1.0f, nullptr);
+    float cy = y + pad;
+    Color(1, 1, 1, 0.96f * a);
+    if (title) g.ctx->DrawTextLayout(D2D1::Point2F(x + pad, cy), title.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+    cy += LayoutHeight(title.get()) + 12 * s;
+    for (auto& r : rows) {
+        if (r.label) {
+            Color(1, 1, 1, 0.5f * a);
+            g.ctx->DrawTextLayout(D2D1::Point2F(x + pad, cy), r.label.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        if (r.value) {
+            Color(1, 1, 1, 0.92f * a);
+            g.ctx->DrawTextLayout(D2D1::Point2F(x + pad + labelW, cy), r.value.get(), g.brush.get(),
+                                  D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        cy += r.h + gap;
+    }
+}
+
 void DrawSpinner() {
     const float s = g.s;
     const double t = Now();
@@ -1353,6 +1651,8 @@ void Render(bool hq) {
     if (e && e->failed && !g_view.appeared) DrawFailed();
     else if (e && !g_view.appeared && Now() - g_view.navTime > 0.2 && !g_closing) DrawSpinner();
     DrawUi(hq);
+    DrawInfoPanel();
+    DrawToast();
     HRESULT hr = g.ctx->EndDraw();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
         RecreateGpu();
@@ -1508,6 +1808,8 @@ void OnList(ListMsg* m) {
     } else if (files[idx] != g_curPath) {  // same file, different case: keep our key
         files[idx] = g_curPath;
     }
+    for (auto& pd : g_pendingDel)  // hidden, about to be deleted
+        files.erase(std::remove(files.begin(), files.end(), pd.path), files.end());
     g_files = std::move(files);
     g_fileIndex.clear();
     for (int i = 0; i < (int)g_files.size(); i++) g_fileIndex[g_files[i]] = i;
@@ -1619,6 +1921,232 @@ int Register(bool add) {
 }
 
 // ---------------------------------------------------------------- input
+
+// ---------------------------------------------------------------- actions
+
+void Activity();
+
+void RebuildIndex() {
+    g_fileIndex.clear();
+    for (int i = 0; i < (int)g_files.size(); i++) g_fileIndex[g_files[i]] = i;
+    g_stripDirty = true;
+}
+
+// Deleting hides the photo at once and really deletes it a few seconds later,
+// so Ctrl+Z can bring it back without fishing in the Recycle Bin.
+void DeleteCurrent() {
+    Entry* e = Cur();
+    if (g_closing || !e || g_files.empty()) return;
+    const int idx = g_cur;
+    const std::wstring path = g_curPath;
+    const bool bin = HasRecycleBin(path);
+    PushGhost(1, false);
+    if (!g_ghosts.empty() && g_ghosts.back().path == path) {  // shrink and fade where it stands
+        Ghost& gh = g_ghosts.back();
+        gh.alpha.params(0.22, 1.0);
+        gh.scale.params(0.32, 1.0);
+        gh.scale.target = gh.scale.x * 0.86;
+    }
+    g_pendingDel.push_back({path, idx, Now()});
+    g_files.erase(g_files.begin() + idx);
+    RebuildIndex();
+    Trace(L"delete %ls (pending)", FileName(path).c_str());
+    if (g_files.empty()) {  // that was the last one
+        g_curPath.clear();
+        Close();
+        return;
+    }
+    const int n = (int)g_files.size();
+    const int next = std::min(idx, n - 1);
+    g_cur = next;
+    g_curPath = g_files[next];
+    g_prevDir = next == idx ? 1 : -1;
+    ResetView(APPEAR_SLIDE, g_prevDir);
+    Evict();
+    RequestDecodes();
+    ShowToast(bin ? L"Deleted  ·  Ctrl+Z to undo" : L"Will be deleted permanently  ·  Ctrl+Z to undo",
+              kDeleteGrace - 0.5);
+    g.needsRedraw = true;
+}
+
+void UndoDelete() {
+    if (g_pendingDel.empty() || g_closing) {
+        ShowToast(L"Nothing to undo", 1.4);
+        return;
+    }
+    const PendingDelete pd = g_pendingDel.back();
+    g_pendingDel.pop_back();
+    const int idx = std::clamp(pd.index, 0, (int)g_files.size());
+    g_files.insert(g_files.begin() + idx, pd.path);
+    if (idx <= g_cur && !g_curPath.empty()) g_cur++;
+    RebuildIndex();
+    Trace(L"undo delete %ls", FileName(pd.path).c_str());
+    Navigate(idx, APPEAR_SLIDE);
+    ShowToast(L"Restored", 1.4);
+}
+
+// Deletes whose grace period is over (or all of them, when closing).
+void CommitDeletes(bool all) {
+    const double now = Now();
+    std::vector<std::wstring> due;
+    for (auto it = g_pendingDel.begin(); it != g_pendingDel.end();) {
+        if (all || now - it->at >= kDeleteGrace) {
+            due.push_back(it->path);
+            it = g_pendingDel.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (due.empty()) return;
+    if (all) {  // closing: do it here and now
+        for (auto& p : due) DeleteForUser(p);
+        return;
+    }
+    HWND hwnd = g.hwnd;
+    std::thread([due, hwnd] {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        for (auto& p : due) {
+            const bool ok = DeleteForUser(p);
+            auto* msg = new std::wstring(p);
+            if (!PostMessageW(hwnd, WM_APP_RECYCLED, ok, (LPARAM)msg)) delete msg;
+        }
+        CoUninitialize();
+    }).detach();
+}
+
+void OnRecycled(bool ok, std::wstring* path) {
+    std::unique_ptr<std::wstring> p(path);
+    Trace(L"delete %ls: %ls", FileName(*p).c_str(), ok ? L"done" : L"FAILED");
+    if (ok) {
+        g_entries.erase(*p);
+        return;
+    }
+    // Couldn't delete (in use, read-only, gone offline...): put it back where it belongs.
+    if (!g_closing && !g_fileIndex.count(*p) && GetFileAttributesW(p->c_str()) != INVALID_FILE_ATTRIBUTES) {
+        auto it = std::lower_bound(g_files.begin(), g_files.end(), *p, [](const std::wstring& a, const std::wstring& b) {
+            return StrCmpLogicalW(FileName(a).c_str(), FileName(b).c_str()) < 0;
+        });
+        const int idx = (int)(it - g_files.begin());
+        g_files.insert(it, *p);
+        if (idx <= g_cur) g_cur++;
+        RebuildIndex();
+    }
+    ShowToast(L"Couldn’t delete " + FileName(*p), 3.0);
+}
+
+void CopyCurrent() {
+    Entry* e = Cur();
+    if (!e || g_closing) return;
+    const std::wstring path = g_curPath;
+    const int turns = e->userRot;
+    HWND hwnd = g.hwnd;
+    ShowToast(L"Copying…", 30);
+    std::thread([path, turns, hwnd] {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        auto* data = new ClipData;
+        PrepareClipboard(path, turns, *data);
+        if (!PostMessageW(hwnd, WM_APP_COPIED, 0, (LPARAM)data)) delete data;
+        CoUninitialize();
+    }).detach();
+}
+
+void OnCopied(ClipData* data) {
+    std::unique_ptr<ClipData> d(data);
+    const bool ok = SetClipboard(g.hwnd, *d);
+    ShowToast(ok ? L"Copied" : L"Couldn’t copy this photo", 1.6);
+}
+
+void RevealCurrent() {
+    if (g_curPath.empty()) return;
+    AllowSetForegroundWindow(ASFW_ANY);
+    std::thread(ShowInExplorer, g_curPath).detach();
+}
+
+void ToggleInfo() {
+    g_infoOpen = !g_infoOpen;
+    if (g_infoOpen) RequestDecodes();
+    g.needsRedraw = true;
+}
+
+// Precision touchpads send scroll messages in small steps (not whole 120-unit
+// notches), and Windows can say where input came from. Mice keep wheel = zoom.
+bool FromTouchpad(int delta, bool horizontal) {
+    if (horizontal && delta % WHEEL_DELTA != 0) g_tp.seenSmallH = true;
+    typedef BOOL(WINAPI * PFN)(INPUT_MESSAGE_SOURCE*);
+    static auto source = (PFN)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetCurrentInputMessageSource");
+    INPUT_MESSAGE_SOURCE src{};
+    if (source && source(&src) && src.deviceType == IMDT_TOUCHPAD) return true;
+    if (delta % WHEEL_DELTA == 0) return false;
+    return horizontal || g_tp.seenSmallH;  // sub-notch vertical alone could be a smooth-scrolling mouse
+}
+
+// Two fingers: pan a zoomed photo, or swipe sideways between photos.
+void TouchpadScroll(double dx, double dy) {
+    Entry* e = Cur();
+    if (!e || !g_view.appeared || g_closing) return;
+    const double now = Now();
+    if (e->info && LargerThanScreen(*e)) {
+        double tx = g_view.panX.x + dx, ty = g_view.panY.x + dy;
+        ClampPan(*e, g_view.zoom.target, tx, ty);
+        g_view.panX.snap(tx);
+        g_view.panY.snap(ty);
+        g.needsRedraw = true;
+        return;
+    }
+    if (dx == 0) return;
+    if (now < g_tp.lockUntil) {  // just changed photo: swallow the gesture's inertia
+        g_tp.lockUntil = now + 0.25;
+        return;
+    }
+    g_tp.swiping = true;
+    g_tp.lastEvent = now;
+    const bool hasNext = g_cur + 1 < (int)g_files.size(), hasPrev = g_cur > 0;
+    double off = g_view.offX.x + dx;
+    if ((off < 0 && !hasNext) || (off > 0 && !hasPrev)) off = g_view.offX.x + dx * 0.3;  // resist at the ends
+    g_view.offX.snap(off);
+    const double th = g.W * 0.12;
+    if (off < -th && hasNext) {
+        g_tp.swiping = false;
+        g_tp.lockUntil = now + 0.35;
+        Navigate(g_cur + 1, APPEAR_SLIDE);
+    } else if (off > th && hasPrev) {
+        g_tp.swiping = false;
+        g_tp.lockUntil = now + 0.35;
+        Navigate(g_cur - 1, APPEAR_SLIDE);
+    }
+    g.needsRedraw = true;
+}
+
+void OnWheel(bool horizontal, WPARAM wp, LPARAM lp) {
+    POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    ScreenToClient(g.hwnd, &p);
+    Activity();
+    const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+    const bool ctrl = (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) != 0;  // also how touchpad pinches arrive
+    if (!horizontal && ctrl) {
+        const double k = std::pow(1.2, delta / 120.0);
+        if (delta % WHEEL_DELTA != 0) ZoomTo(g_view.zoom.target * k, p.x, p.y, 0.1, 1.0);  // pinch: follow the fingers
+        else ZoomBy(k, p.x, p.y);
+        return;
+    }
+    if (FromTouchpad(delta, horizontal)) {
+        const double px = delta * 0.9 * g.s / 1.0;
+        if (horizontal) TouchpadScroll(-px, 0);
+        else TouchpadScroll(0, px);
+        return;
+    }
+    if (horizontal) {  // tilt wheel: pan when zoomed in
+        Entry* e = Cur();
+        if (e && !g_view.fitted) {
+            double tx = g_view.panX.target - delta / 120.0 * 80 * g.s, ty = g_view.panY.target;
+            ClampPan(*e, g_view.zoom.target, tx, ty);
+            g_view.panX.target = tx;
+            g.needsRedraw = true;
+        }
+        return;
+    }
+    ZoomBy(std::pow(1.2, delta / 120.0), p.x, p.y);
+}
 
 void OnButton(Btn b) {
     switch (b) {
@@ -1798,7 +2326,19 @@ void OnKey(WPARAM vk) {
     switch (vk) {
         case VK_ESCAPE:
             if (g_slideshow) ToggleSlideshow();
+            else if (g_infoOpen) ToggleInfo();
             else Close();
+            break;
+        case 'I': ToggleInfo(); break;
+        case VK_DELETE: DeleteCurrent(); break;
+        case 'Z':
+            if (ctrl) UndoDelete();
+            break;
+        case 'C':
+            if (ctrl) CopyCurrent();
+            break;
+        case 'E':
+            if (ctrl) RevealCurrent();
             break;
         case VK_RIGHT: case VK_NEXT: case VK_SPACE:
             if (g_slideshow) g_slideshow = false;
@@ -1853,7 +2393,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetForegroundWindow(hwnd);
             return TRUE;
         }
+        case WM_APP_COPIED: OnCopied(reinterpret_cast<ClipData*>(lp)); return 0;
+        case WM_APP_RECYCLED: OnRecycled(wp != 0, reinterpret_cast<std::wstring*>(lp)); return 0;
         case WM_TIMER:
+            CommitDeletes(false);
             SlideshowTick();
             return 0;
         case WM_KEYDOWN:
@@ -1875,24 +2418,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_view.offX.target = 0;
             }
             return 0;
-        case WM_MOUSEWHEEL: {
-            POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            ScreenToClient(hwnd, &p);
-            Activity();
-            const double delta = GET_WHEEL_DELTA_WPARAM(wp) / 120.0;
-            ZoomBy(std::pow(1.2, delta), p.x, p.y);
-            return 0;
-        }
-        case WM_MOUSEHWHEEL: {
-            Entry* e = Cur();
-            if (e && !g_view.fitted) {
-                double tx = g_view.panX.target - GET_WHEEL_DELTA_WPARAM(wp) / 120.0 * 80 * g.s, ty = g_view.panY.target;
-                ClampPan(*e, g_view.zoom.target, tx, ty);
-                g_view.panX.target = tx;
-                g.needsRedraw = true;
-            }
-            return 0;
-        }
+        case WM_MOUSEWHEEL: OnWheel(false, wp, lp); return 0;
+        case WM_MOUSEHWHEEL: OnWheel(true, wp, lp); return 0;
         case WM_SETCURSOR:
             if (LOWORD(lp) == HTCLIENT) {
                 if (g_ui.target < 0.5 && !g_drag.active && !g_closing) SetCursor(nullptr);
@@ -2146,6 +2673,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             last = Now();
         }
     }
+    CommitDeletes(true);
     Trace(L"exit");
     ExitProcess(0);  // don't wait for in-flight decodes
     return 0;
