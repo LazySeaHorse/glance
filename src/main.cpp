@@ -64,20 +64,24 @@ double Now() {
 
 bool g_trace = false;
 double g_traceBase = 0;  // Now() value that corresponds to process creation
+// The file stays open: reopening it per line cost ~8 ms each (antivirus scans on close).
 void Trace(const wchar_t* fmt, ...) {
     if (!g_trace) return;
+    const double t = Now();  // before any file work, so the time is the caller's
+    static FILE* f = [] {
+        wchar_t path[MAX_PATH];
+        GetTempPathW(MAX_PATH, path);
+        wcscat(path, L"glance-trace.txt");
+        return _wfopen(path, L"a, ccs=UTF-8");
+    }();
+    if (!f) return;
     wchar_t msg[600];
     va_list ap;
     va_start(ap, fmt);
     vswprintf(msg, 600, fmt, ap);
     va_end(ap);
-    wchar_t path[MAX_PATH];
-    GetTempPathW(MAX_PATH, path);
-    wcscat(path, L"glance-trace.txt");
-    FILE* f = _wfopen(path, L"a, ccs=UTF-8");
-    if (!f) return;
-    fwprintf(f, L"%8.1f ms  %ls\n", (Now() - g_traceBase) * 1000.0, msg);
-    fclose(f);
+    fwprintf(f, L"%8.1f ms  %ls\n", (t - g_traceBase) * 1000.0, msg);
+    fflush(f);  // ExitProcess doesn't flush, and a crash shouldn't lose lines
 }
 
 // ---------------------------------------------------------------- graphics
@@ -373,6 +377,7 @@ bool InitDevice() {
         hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, fls + 1, 4, D3D11_SDK_VERSION,
                                g.d3d.put(), nullptr, nullptr);
     if (FAILED(hr)) return false;
+    Trace(L"D3D11 device created");
     if (FAILED(g.d3d.as(g.dxgi))) return false;
     ComPtr<IDXGIDevice1> d1;
     if (SUCCEEDED(g.d3d.as(d1))) d1->SetMaximumFrameLatency(1);
@@ -383,6 +388,7 @@ bool InitDevice() {
                                      g.factory.putVoid())))
             return false;
     }
+    Trace(L"D2D factory ready");
     if (FAILED(g.factory->CreateDevice(g.dxgi.get(), g.dev.put()))) return false;
     if (FAILED(g.dev->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, g.ctx.put()))) return false;
     g.ctx->SetUnitMode(D2D1_UNIT_MODE_PIXELS);
@@ -3171,8 +3177,10 @@ HWND CreateMainWindow(DWORD exStyle) {
         RegisterClassExW(&wc);
         registered = true;
     }
-    return CreateWindowExW(exStyle | WS_EX_APPWINDOW | WS_EX_ACCEPTFILES, L"GlanceViewer", kAppName, WS_POPUP,
-                           g.monX, g.monY, g.W, g.H, nullptr, nullptr, inst, nullptr);
+    HWND h = CreateWindowExW(exStyle | WS_EX_APPWINDOW | WS_EX_ACCEPTFILES, L"GlanceViewer", kAppName, WS_POPUP,
+                             g.monX, g.monY, g.W, g.H, nullptr, nullptr, inst, nullptr);
+    Trace(L"window created");
+    return h;
 }
 
 void SetDpiAwareness() {

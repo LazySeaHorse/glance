@@ -141,7 +141,11 @@ Set the environment variable `GLANCE_TRACE=1` (or pass `--trace`) and Glance app
 
 ```
    12.0 ms  ---- start
+   14.2 ms  decode started
+   33.5 ms  D3D11 device created
+   35.1 ms  D2D factory ready
    41.3 ms  GPU device ready
+   43.0 ms  window created
    55.9 ms  window ready (composition)
    58.1 ms  decoded IMG_0001.JPG level 0 (160x120) in 3.9 ms
    60.4 ms  first image on screen
