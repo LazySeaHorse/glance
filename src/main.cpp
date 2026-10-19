@@ -127,6 +127,7 @@ struct Entry {
     Bmp lv[3];
     std::vector<Bmp> anim;   // animated GIF frames (screen-fit size)
     std::vector<int> delays;  // ms per frame
+    double thumbAt = -1;      // when a filmstrip picture first became available (fade-in)
     int userRot = 0;  // quarter turns, view only
 };
 
@@ -173,7 +174,8 @@ std::vector<Ghost> g_ghosts;
 
 Spring g_bg{0.32, 1.0, 0.002};
 Spring g_ui{0.22, 1.0, 0.003};
-Spring g_strip{0.38, 0.9, 0.3};
+Spring g_strip{0.38, 0.9, 0.3};      // filmstrip scroll position (layout units)
+Spring g_stripK{0.24, 0.92, 0.002};   // filmstrip scale: compact <-> full, follows the pointer
 bool g_stripSnapped = false;
 const float kBgAlpha = 0.88f;
 
@@ -204,10 +206,11 @@ struct Drag {
 } g_drag;
 bool g_releasing = false;
 
-// filmstrip geometry (in file order)
-std::vector<float> g_stripW, g_stripL;
-float g_stripTotal = 0;
-bool g_stripDirty = true;
+// The filmstrip is laid out in "units" (its full-size pixels) and drawn scaled
+// by g_stripK around the bottom centre. Cells are uniform, so thumbnails
+// arriving never shift the layout.
+bool g_stripDirty = true;  // kept for callers; uniform cells need no rebuild
+const float kStripMinScale = 0.5f;
 
 // ---------------------------------------------------------------- helpers
 
@@ -797,6 +800,7 @@ void ProcessResults() {
             e.failed = true;
             g_stripDirty = true;
         }
+        const bool hadPicture = e.lv[0].b || e.lv[1].b || e.lv[2].b;
         bool ok = r.ok;
         if (ok) {
             Bmp b = Upload(r.pixels, r.pxW, r.pxH);
@@ -822,6 +826,7 @@ void ProcessResults() {
             else e.fullFailed = true;  // e.g. too big for memory: keep showing the screen-sized version
         }
         if (!r.thumb.empty() && !e.lv[0].b) e.lv[0] = Upload(r.thumb, r.thW, r.thH);
+        if (!hadPicture && (e.lv[0].b || e.lv[1].b || e.lv[2].b) && e.thumbAt < 0) e.thumbAt = Now();
         if (r.path == g_curPath) {
             curChanged = true;
             Trace(L"decoded %ls level %d (%dx%d) in %.1f ms", FileName(r.path).c_str(), r.level, r.pxW, r.pxH, r.ms);
@@ -842,65 +847,61 @@ void ProcessResults() {
 
 // ---------------------------------------------------------------- filmstrip layout
 
-float ThumbH() { return 56.0f * g.s; }
+float ThumbH() { return 56.0f * g.s; }  // full-size cell (square)
 float StripPad() { return 8.0f * g.s; }
 float StripGap() { return 6.0f * g.s; }
+float StripFullH() { return ThumbH() + 2 * StripPad(); }
+float StripBottom() { return g.H - 22.0f * g.s; }
+float StripY() { return StripBottom() - StripFullH(); }  // top of the strip at full size (toolbar sits above it)
 float StripMaxInner() { return std::max(100.0f, g.W - 2 * 90.0f * g.s - 2 * StripPad()); }
-float StripY() { return g.H - 22.0f * g.s - (ThumbH() + 2 * StripPad()); }
 bool StripVisible() { return g_files.size() > 1; }
+float StripK() { return (float)std::clamp(g_stripK.x, (double)kStripMinScale * 0.8, 1.05); }
+float CellL(int i) { return i * (ThumbH() + StripGap()); }
+float StripTotal() { return g_files.empty() ? 0 : g_files.size() * (ThumbH() + StripGap()) - StripGap(); }
+float StripInner() { return std::min(StripTotal(), StripMaxInner()); }
 
-void RebuildStrip() {
-    const int n = (int)g_files.size();
-    const float th = ThumbH(), gap = StripGap();
-    g_stripW.resize(n);
-    g_stripL.resize(n);
-    float x = 0;
-    for (int i = 0; i < n; i++) {
-        float w = th;
-        Entry* e = Find(g_files[i]);
-        if (e && e->info && e->w && e->h) {
-            double ew, eh;
-            EffSize(*e, e->userRot, ew, eh);
-            w = std::clamp((float)(th * ew / eh), th * 0.62f, th * 1.6f);
-        }
-        g_stripW[i] = w;
-        g_stripL[i] = x;
-        x += w + gap;
-    }
-    g_stripTotal = n ? x - gap : 0;
-    g_stripDirty = false;
-}
+void RebuildStrip() { g_stripDirty = false; }
 
 float StripTarget() {
-    if (g_files.empty() || g_cur >= (int)g_stripL.size()) return 0;
-    const float maxIn = StripMaxInner();
-    if (g_stripTotal <= maxIn) return g_stripTotal / 2;
-    const float c = g_stripL[g_cur] + g_stripW[g_cur] / 2;
-    return std::clamp(c, maxIn / 2, g_stripTotal - maxIn / 2);
+    if (g_files.empty()) return 0;
+    const float total = StripTotal(), maxIn = StripMaxInner();
+    if (total <= maxIn) return total / 2;
+    const float c = CellL(g_cur) + ThumbH() / 2;
+    return std::clamp(c, maxIn / 2, total - maxIn / 2);
 }
 
 D2D1_RECT_F StripPill() {
-    const float inner = std::min(g_stripTotal, StripMaxInner());
-    const float pad = StripPad(), y = StripY();
-    return D2D1::RectF(g.W / 2.0f - inner / 2 - pad, y, g.W / 2.0f + inner / 2 + pad, y + ThumbH() + 2 * pad);
+    const float k = StripK();
+    const float halfW = (StripInner() / 2 + StripPad()) * k;
+    return D2D1::RectF(g.W / 2.0f - halfW, StripBottom() - StripFullH() * k, g.W / 2.0f + halfW, StripBottom());
 }
 
 D2D1_RECT_F ThumbRect(int i) {
-    const float x = g.W / 2.0f - (float)g_strip.x + g_stripL[i];
-    const float y = StripY() + StripPad();
-    return D2D1::RectF(x, y, x + g_stripW[i], y + ThumbH());
+    const float k = StripK();
+    const float x = g.W / 2.0f + (CellL(i) - (float)g_strip.x) * k;
+    const float y = StripBottom() - StripFullH() * k + StripPad() * k;
+    return D2D1::RectF(x, y, x + ThumbH() * k, y + ThumbH() * k);
 }
 
 void VisibleThumbs(int& first, int& last) {
     first = 0;
     last = -1;
-    if (g_stripL.empty()) return;
-    const float inner = std::min(g_stripTotal, StripMaxInner());
-    const float lo = (float)g_strip.x - inner / 2 - ThumbH() * 2, hi = (float)g_strip.x + inner / 2;
-    first = (int)(std::lower_bound(g_stripL.begin(), g_stripL.end(), lo) - g_stripL.begin());
-    first = std::max(0, first - 1);
-    last = first;
-    while (last + 1 < (int)g_stripL.size() && g_stripL[last + 1] < hi) last++;
+    const int n = (int)g_files.size();
+    if (n == 0) return;
+    const float cell = ThumbH() + StripGap();
+    const float inner = StripInner();
+    const float lo = (float)g_strip.x - inner / 2 - cell, hi = (float)g_strip.x + inner / 2 + cell;
+    first = std::clamp((int)std::floor(lo / cell), 0, n - 1);
+    last = std::clamp((int)std::ceil(hi / cell), 0, n - 1);
+}
+
+// 0..1: how close the pointer is to the filmstrip (1 = on it). Drives its size.
+double StripProximity(float y) {
+    const float ramp = 170.0f * g.s;
+    const float d = StripY() - y;  // distance above the full-size strip's top edge
+    if (d <= 0) return 1.0;
+    const double p = std::clamp(1.0 - d / ramp, 0.0, 1.0);
+    return p * p * (3 - 2 * p);  // smoothstep
 }
 
 void LayoutButtons() {
@@ -967,6 +968,7 @@ bool Update(double dt) {
     anim |= g_bg.step(dt);
     anim |= g_ui.step(dt);
     if (g_stripDirty) RebuildStrip();
+    anim |= g_stripK.step(dt);
     g_strip.target = StripTarget();
     if (!g_stripSnapped) {
         g_strip.snap(g_strip.target);
@@ -996,6 +998,17 @@ bool Update(double dt) {
                                   [](const Ghost& gh) { return gh.alpha.x < 0.004 && gh.alpha.target == 0; }),
                    g_ghosts.end());
     if (!g_ghosts.empty()) anim = true;
+
+    // filmstrip thumbnails fading in as they arrive
+    if (g_ui.x > 0.01 && StripVisible()) {
+        int first, last;
+        VisibleThumbs(first, last);
+        const double t = Now();
+        for (int i = first; i <= last && !anim; i++) {
+            Entry* te = Find(g_files[i]);
+            if (te && te->thumbAt >= 0 && t - te->thumbAt < 0.22) anim = true;
+        }
+    }
 
     // animated GIF: advance frames on their own clock (render only when a frame changes)
     Entry* e = Cur();
@@ -1029,6 +1042,13 @@ void UpdateUiTarget() {
     ScreenToClient(g.hwnd, &p);
     const bool hover = g_ui.x > 0.3 && OverUi((float)p.x, (float)p.y);
     const bool show = (Now() - g_lastActivity < 2.2) || hover || g_drag.active;
+    if (!g_drag.active) {
+        const double k = kStripMinScale + (1.0 - kStripMinScale) * StripProximity((float)p.y);
+        if (std::fabs(k - g_stripK.target) > 1e-4) {
+            g_stripK.target = k;
+            g.needsRedraw = true;
+        }
+    }
     if (!show && g_ui.target > 0.5 && GetForegroundWindow() == g.hwnd) SetCursor(nullptr);  // hide with the controls
     g_ui.target = show ? 1 : 0;
 }
@@ -1236,19 +1256,31 @@ void DrawUi(bool hq) {
     }
 
     // filmstrip
-    if (!StripVisible() || g_stripL.size() != g_files.size()) return;
+    if (!StripVisible()) return;
+    const float k = StripK();
     const D2D1_RECT_F pill = StripPill();
     Color(0.08f, 0.08f, 0.09f, 0.62f * a);
-    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(pill, 14 * s, 14 * s), g.brush.get());
-    const D2D1_RECT_F clip = D2D1::RectF(pill.left + StripPad() * 0.5f, pill.top, pill.right - StripPad() * 0.5f, pill.bottom);
+    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(pill, 14 * s * k, 14 * s * k), g.brush.get());
+    const D2D1_RECT_F clip =
+        D2D1::RectF(pill.left + StripPad() * 0.5f * k, pill.top, pill.right - StripPad() * 0.5f * k, pill.bottom);
     g.ctx->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
     int first, last;
     VisibleThumbs(first, last);
-    const bool stripStill = hq && g_strip.settled();
+    const bool stripStill = hq && g_strip.settled() && g_stripK.settled();
+    const double now = Now();
     for (int i = first; i <= last; i++) {
         const D2D1_RECT_F r = ThumbRect(i);
+        if (r.right < clip.left || r.left > clip.right) continue;
         Entry* te = Find(g_files[i]);
-        const float ta = (i == g_cur ? 1.0f : (i == g_hoverThumb ? 0.95f : 0.62f)) * a;
+        float ta = (i == g_cur ? 1.0f : (i == g_hoverThumb ? 0.95f : 0.62f)) * a;
+        if (te && te->thumbAt >= 0) {  // fade in, so arriving thumbnails don't pop
+            const float f = (float)std::clamp((now - te->thumbAt) / 0.2, 0.0, 1.0);
+            if (f < 1) {
+                Color(1, 1, 1, 0.08f * a * (1 - f));
+                g.ctx->FillRectangle(r, g.brush.get());
+            }
+            ta *= f * (2 - f);
+        }
         if (te) DrawThumb(*te, r, ta, stripStill);
         else {
             Color(1, 1, 1, 0.08f * a);
@@ -1256,13 +1288,14 @@ void DrawUi(bool hq) {
         }
     }
     g.ctx->PopAxisAlignedClip();
-    if (g_cur < (int)g_stripL.size()) {
+    if (g_cur < (int)g_files.size()) {
         D2D1_RECT_F r = ThumbRect(g_cur);
-        const float o = 2.5f * s;
+        const float o = 2.5f * s * k;
         r = D2D1::RectF(r.left - o, r.top - o, r.right + o, r.bottom + o);
         if (r.left > clip.left - o - 1 && r.right < clip.right + o + 1) {
             Color(1, 1, 1, 0.95f * a);
-            g.ctx->DrawRoundedRectangle(D2D1::RoundedRect(r, 3 * s, 3 * s), g.brush.get(), 2.0f * s, nullptr);
+            g.ctx->DrawRoundedRectangle(D2D1::RoundedRect(r, 3 * s * k, 3 * s * k), g.brush.get(),
+                                        std::max(1.5f, 2.0f * s * k), nullptr);
         }
     }
 }
@@ -2057,6 +2090,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     g_bg.snap(0);
     g_bg.target = 1;
     g_ui.snap(0);
+    g_stripK.snap(kStripMinScale);
     g_lastActivity = Now() - 0.6;  // controls show briefly, then get out of the way
     ResetView(APPEAR_OPEN, 1);
     SetTimer(g.hwnd, TIMER_TICK, 100, nullptr);
