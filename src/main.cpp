@@ -2339,62 +2339,110 @@ void OnDoubleClick(int x, int y) {
     else ZoomTo(fit, x, y, 0.38, 0.86);
 }
 
+// ---------------------------------------------------------------- keyboard
+
+enum : uint8_t { M_CTRL = 1, M_ALT = 2, M_SHIFT = 4 };
+
+// One table drives both the keyboard and the shortcuts list (F1).
+struct KeyDef {
+    uint8_t vk, vkLast;   // a key, or a range of keys; 0 for rows that exist only to be listed
+    uint8_t mods;         // Ctrl and Alt must match exactly; Shift only has to be down when M_SHIFT is set
+    void (*run)(UINT vk);
+    const wchar_t* keys;  // left column of the list; null on rows that continue the one above, and on headings
+    const wchar_t* what;  // right column; a heading when run and keys are null
+};
+
+void KeyEscape(UINT) {
+    if (g_slideshow) ToggleSlideshow();
+    else if (g_infoOpen) ToggleInfo();
+    else Close();
+}
+void KeyClose(UINT) { Close(); }
+void KeyInfo(UINT) { ToggleInfo(); }
+void KeyDelete(UINT) { DeleteCurrent(); }
+void KeyUndo(UINT) { UndoDelete(); }
+void KeyCopy(UINT) { CopyCurrent(); }
+void KeyReveal(UINT) { RevealCurrent(); }
+void KeyNext(UINT) {
+    g_slideshow = false;
+    Navigate(g_cur + 1, APPEAR_SLIDE);
+}
+void KeyPrev(UINT) {
+    g_slideshow = false;
+    Navigate(g_cur - 1, APPEAR_SLIDE);
+}
+void KeyFirst(UINT) { Navigate(0, APPEAR_SLIDE); }
+void KeyLast(UINT) { Navigate((int)g_files.size() - 1, APPEAR_SLIDE); }
+void KeyPan(UINT vk) {
+    Entry* e = Cur();
+    if (!e || g_view.fitted) return;
+    double tx = g_view.panX.target, ty = g_view.panY.target + (vk == VK_UP ? 1 : -1) * g.H * 0.15;
+    ClampPan(*e, g_view.zoom.target, tx, ty);
+    g_view.panY.params(0.3, 0.95);
+    g_view.panY.target = ty;
+    g.needsRedraw = true;
+}
+void KeyRotateLeft(UINT) { Rotate(-1); }
+void KeyRotateRight(UINT) { Rotate(1); }
+void KeyZoomIn(UINT) { ZoomBy(1.4, g.W / 2.0, g.H / 2.0); }
+void KeyZoomOut(UINT) { ZoomBy(1 / 1.4, g.W / 2.0, g.H / 2.0); }
+void KeyFit(UINT) { ZoomToFit(); }
+void KeyActualSize(UINT) { ZoomTo(1.0, g.W / 2.0, g.H / 2.0, 0.38, 0.86); }
+void KeySlideshow(UINT) { ToggleSlideshow(); }
+
+const KeyDef kKeys[] = {
+    {0, 0, 0, nullptr, nullptr, L"Browse"},
+    {VK_RIGHT, VK_RIGHT, 0, KeyNext, L"→   Space   Page Down", L"Next photo"},
+    {VK_NEXT, VK_NEXT, 0, KeyNext, nullptr, nullptr},
+    {VK_SPACE, VK_SPACE, 0, KeyNext, nullptr, nullptr},
+    {VK_LEFT, VK_LEFT, 0, KeyPrev, L"←   Backspace   Page Up", L"Previous photo"},
+    {VK_PRIOR, VK_PRIOR, 0, KeyPrev, nullptr, nullptr},
+    {VK_BACK, VK_BACK, 0, KeyPrev, nullptr, nullptr},
+    {VK_HOME, VK_HOME, 0, KeyFirst, L"Home", L"First photo"},
+    {VK_END, VK_END, 0, KeyLast, L"End", L"Last photo"},
+    {VK_F5, VK_F5, 0, KeySlideshow, L"S   F5", L"Slideshow"},
+    {'S', 'S', 0, KeySlideshow, nullptr, nullptr},
+
+    {0, 0, 0, nullptr, nullptr, L"View"},
+    {VK_OEM_PLUS, VK_OEM_PLUS, 0, KeyZoomIn, L"+   −", L"Zoom in / out"},
+    {VK_ADD, VK_ADD, 0, KeyZoomIn, nullptr, nullptr},
+    {VK_OEM_MINUS, VK_OEM_MINUS, 0, KeyZoomOut, nullptr, nullptr},
+    {VK_SUBTRACT, VK_SUBTRACT, 0, KeyZoomOut, nullptr, nullptr},
+    {'0', '0', M_CTRL, KeyFit, L"Ctrl+0", L"Fit to screen"},
+    {VK_NUMPAD0, VK_NUMPAD0, M_CTRL, KeyFit, nullptr, nullptr},
+    {'1', '1', M_CTRL, KeyActualSize, L"Ctrl+1", L"Actual size (100%)"},
+    {VK_NUMPAD1, VK_NUMPAD1, M_CTRL, KeyActualSize, nullptr, nullptr},
+    {0, 0, 0, nullptr, L"Double-click", L"Fit / actual size"},
+    {VK_UP, VK_UP, 0, KeyPan, L"↑   ↓", L"Pan when zoomed"},
+    {VK_DOWN, VK_DOWN, 0, KeyPan, nullptr, nullptr},
+    {'R', 'R', M_SHIFT, KeyRotateLeft, L"R   Shift+R", L"Rotate right / left"},
+    {'R', 'R', 0, KeyRotateRight, nullptr, nullptr},
+    {'L', 'L', 0, KeyRotateLeft, nullptr, nullptr},
+    {VK_OEM_6, VK_OEM_6, 0, KeyRotateRight, L"]   [", L"Rotate right / left"},
+    {VK_OEM_4, VK_OEM_4, 0, KeyRotateLeft, nullptr, nullptr},
+
+    {0, 0, 0, nullptr, nullptr, L"Photo"},
+    {'I', 'I', 0, KeyInfo, L"I", L"Photo info"},
+    {'C', 'C', M_CTRL, KeyCopy, L"Ctrl+C", L"Copy the photo"},
+    {'E', 'E', M_CTRL, KeyReveal, L"Ctrl+E", L"Show in Explorer"},
+    {VK_DELETE, VK_DELETE, 0, KeyDelete, L"Delete   Ctrl+Z", L"Delete / undo"},
+    {'Z', 'Z', M_CTRL, KeyUndo, nullptr, nullptr},
+
+    {0, 0, 0, nullptr, nullptr, L"Other"},
+    {VK_ESCAPE, VK_ESCAPE, 0, KeyEscape, L"Esc   Ctrl+W", L"Close"},
+    {'W', 'W', M_CTRL, KeyClose, nullptr, nullptr},
+};
+
 void OnKey(WPARAM vk) {
-    const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
-    const int n = (int)g_files.size();
-    switch (vk) {
-        case VK_ESCAPE:
-            if (g_slideshow) ToggleSlideshow();
-            else if (g_infoOpen) ToggleInfo();
-            else Close();
-            break;
-        case 'I': ToggleInfo(); break;
-        case VK_DELETE: DeleteCurrent(); break;
-        case 'Z':
-            if (ctrl) UndoDelete();
-            break;
-        case 'C':
-            if (ctrl) CopyCurrent();
-            break;
-        case 'E':
-            if (ctrl) RevealCurrent();
-            break;
-        case VK_RIGHT: case VK_NEXT: case VK_SPACE:
-            if (g_slideshow) g_slideshow = false;
-            Navigate(g_cur + 1, APPEAR_SLIDE);
-            break;
-        case VK_LEFT: case VK_PRIOR: case VK_BACK:
-            if (g_slideshow) g_slideshow = false;
-            Navigate(g_cur - 1, APPEAR_SLIDE);
-            break;
-        case VK_HOME: Navigate(0, APPEAR_SLIDE); break;
-        case VK_END: Navigate(n - 1, APPEAR_SLIDE); break;
-        case VK_UP: case VK_DOWN: {
-            Entry* e = Cur();
-            if (e && !g_view.fitted) {
-                double tx = g_view.panX.target, ty = g_view.panY.target + (vk == VK_UP ? 1 : -1) * g.H * 0.15;
-                ClampPan(*e, g_view.zoom.target, tx, ty);
-                g_view.panY.params(0.3, 0.95);
-                g_view.panY.target = ty;
-                g.needsRedraw = true;
-            }
-            break;
-        }
-        case 'R': Rotate(shift ? -1 : 1); break;
-        case 'L': Rotate(-1); break;
-        case VK_OEM_6: Rotate(1); break;   // ]
-        case VK_OEM_4: Rotate(-1); break;  // [
-        case VK_OEM_PLUS: case VK_ADD: ZoomBy(1.4, g.W / 2.0, g.H / 2.0); break;
-        case VK_OEM_MINUS: case VK_SUBTRACT: ZoomBy(1 / 1.4, g.W / 2.0, g.H / 2.0); break;
-        case '0': case VK_NUMPAD0: ZoomToFit(); break;
-        case '1': case VK_NUMPAD1: ZoomTo(1.0, g.W / 2.0, g.H / 2.0, 0.38, 0.86); break;
-        case VK_F5: case 'S': ToggleSlideshow(); break;
-        case 'W':
-            if (ctrl) Close();
-            break;
-        default: return;
+    const uint8_t mods = (GetKeyState(VK_CONTROL) < 0 ? M_CTRL : 0) | (GetKeyState(VK_MENU) < 0 ? M_ALT : 0);
+    const bool shift = GetKeyState(VK_SHIFT) < 0;
+    for (const KeyDef& k : kKeys) {
+        if (!k.run || vk < k.vk || vk > k.vkLast) continue;
+        if ((k.mods & (M_CTRL | M_ALT)) != mods || ((k.mods & M_SHIFT) && !shift)) continue;
+        k.run((UINT)vk);
+        Activity();
+        return;
     }
-    Activity();
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {

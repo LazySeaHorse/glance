@@ -25,7 +25,7 @@ Windows SmartScreen will warn that the file isn't signed: *More info → Run any
 | Next / previous | swipe (drag) left/right, two-finger swipe on a touchpad, side mouse buttons, filmstrip | → ← / Page Down Page Up / Space / Backspace |
 | First / last | | Home / End |
 | Zoom in / out | scroll wheel or touchpad pinch (zooms where the pointer is) | + / − |
-| Fit / 100% | double-click toggles | 0 / 1 |
+| Fit / 100% | double-click toggles | Ctrl+0 / Ctrl+1 |
 | Pan when zoomed | drag (flicks keep coasting), two fingers on a touchpad | ↑ ↓ |
 | Rotate | ↺ ↻ buttons | R (clockwise), L or Shift+R (counter-clockwise), [ ] |
 | Slideshow | ▶ button | S or F5; Esc stops |
