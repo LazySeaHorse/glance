@@ -208,6 +208,8 @@ const double kGridOn = 4.0, kGridOff = 3.6;  // pixel-grid view starts above 400
 // Info panel (I), toast messages, pending deletes, touchpad gestures.
 bool g_infoOpen = false;
 Spring g_info{0.3, 0.92, 0.002};
+bool g_helpOpen = false;  // the shortcuts list (F1)
+Spring g_help{0.3, 0.92, 0.002};
 D2D1_RECT_F g_infoBox{};  // where the panel was last drawn, so clicks on it aren't clicks on the background
 std::wstring g_toastText;
 double g_toastUntil = 0;
@@ -1176,6 +1178,8 @@ bool Update(double dt) {
     anim |= g_toast.step(dt);
     g_info.target = g_infoOpen ? 1 : 0;
     anim |= g_info.step(dt);
+    g_help.target = g_helpOpen ? 1 : 0;
+    anim |= g_help.step(dt);
 
     // two-finger swipe on a touchpad: when the fingers stop without passing
     // the threshold, ease back
@@ -1542,6 +1546,20 @@ void DrawUi(bool hq) {
     }
 }
 
+enum : uint8_t { M_CTRL = 1, M_ALT = 2, M_SHIFT = 4 };
+
+// One table drives both the keyboard and the shortcuts list (F1).
+struct KeyDef {
+    uint8_t vk, vkLast;   // a key, or a range of keys; 0 for rows that exist only to be listed
+    uint8_t mods;         // Ctrl and Alt must match exactly; Shift only has to be down when M_SHIFT is set
+    void (*run)(UINT vk);
+    const wchar_t* keys;  // left column of the list; null on rows that continue the one above, and on headings
+    const wchar_t* what;  // right column; a heading when run and keys are null
+};
+
+extern const KeyDef kKeys[];
+extern const size_t kKeyCount;
+
 // ---------------------------------------------------------------- toast & info panel
 
 void ShowToast(const std::wstring& text, double seconds) {
@@ -1646,6 +1664,64 @@ void DrawInfoPanel() {
     }
 }
 
+// Every shortcut, straight from kKeys, in two columns. Nothing exists until it's opened.
+void DrawHelp() {
+    const float a = (float)std::clamp(g_help.x, 0.0, 1.0) * (float)std::clamp(g_bg.x, 0.0, 1.0);
+    if (a < 0.003f) return;
+    const float s = g.s, pad = 26 * s, rowH = 25 * s, headH = 38 * s, keyW = 210 * s, whatW = 250 * s;
+    auto heading = [](const KeyDef& k) { return k.what && !k.run && !k.keys; };
+    auto heightOf = [&](const KeyDef& k) { return !k.what ? 0.0f : heading(k) ? headH : rowH; };
+    float total = 0;
+    for (size_t i = 0; i < kKeyCount; i++) total += heightOf(kKeys[i]);
+    // the second column starts at the first heading past the halfway point
+    size_t split = kKeyCount;
+    float h1 = total, acc = 0;
+    for (size_t i = 0; i < kKeyCount; i++) {
+        if (split == kKeyCount && heading(kKeys[i]) && acc >= total / 2) {
+            split = i;
+            h1 = acc;
+        }
+        acc += heightOf(kKeys[i]);
+    }
+    const int cols = split < kKeyCount ? 2 : 1;
+    const float bw = cols * (keyW + whatW) + (cols + 1) * pad, bh = std::max(h1, total - h1) + 2 * pad;
+    const float k = std::min(1.0f, (g.W - 40 * s) / bw);  // shrink to fit narrow screens
+    const float bx = (g.W - bw) / 2, by = (g.H - bh) / 2 + (1 - (float)g_help.x) * 14 * s;
+    g.ctx->SetTransform(D2D1::Matrix3x2F::Scale(k, k, D2D1::Point2F(g.W / 2.0f, g.H / 2.0f)));
+    const D2D1_RECT_F box = D2D1::RectF(bx, by, bx + bw, by + bh);
+    Color(0.07f, 0.07f, 0.08f, 0.93f * a);
+    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(box, 16 * s, 16 * s), g.brush.get());
+    Color(1, 1, 1, 0.08f * a);
+    g.ctx->DrawRoundedRectangle(D2D1::RoundedRect(box, 16 * s, 16 * s), g.brush.get(), 1.0f, nullptr);
+    float x = bx + pad, y = by + pad;
+    for (size_t i = 0; i < kKeyCount; i++) {
+        const KeyDef& d = kKeys[i];
+        if (!d.what) continue;
+        if (i == split) {
+            x += keyW + whatW + pad;
+            y = by + pad;
+        }
+        if (heading(d)) {
+            if (auto lay = Layout(d.what, g.fontSmallBold.get(), keyW + whatW, false)) {
+                Color(1, 1, 1, 0.45f * a);
+                g.ctx->DrawTextLayout(D2D1::Point2F(x, y + headH - rowH), lay.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+            y += headH;
+            continue;
+        }
+        if (auto lay = Layout(d.keys, g.fontSmallBold.get(), keyW, false)) {
+            Color(1, 1, 1, 0.94f * a);
+            g.ctx->DrawTextLayout(D2D1::Point2F(x, y), lay.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        if (auto lay = Layout(d.what, g.fontSmall.get(), whatW, false)) {
+            Color(1, 1, 1, 0.68f * a);
+            g.ctx->DrawTextLayout(D2D1::Point2F(x + keyW, y), lay.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        y += rowH;
+    }
+    g.ctx->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
 void DrawSpinner() {
     const float s = g.s;
     const double t = Now();
@@ -1694,6 +1770,7 @@ void Render(bool hq) {
     else if (e && !g_view.appeared && Now() - g_view.navTime > 0.2 && !g_closing) DrawSpinner();
     DrawUi(hq);
     DrawInfoPanel();
+    DrawHelp();
     DrawToast();
     HRESULT hr = g.ctx->EndDraw();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -2113,6 +2190,11 @@ void ToggleInfo() {
     g.needsRedraw = true;
 }
 
+void ToggleHelp() {
+    g_helpOpen = !g_helpOpen;
+    g.needsRedraw = true;
+}
+
 // Precision touchpads send scroll messages in small steps (not whole 120-unit
 // notches), and Windows can say where input came from. Mice keep wheel = zoom.
 bool FromTouchpad(int delta, bool horizontal) {
@@ -2220,6 +2302,10 @@ void Activity() { g_lastActivity = Now(); }
 void OnMouseDown(int x, int y) {
     Activity();
     g_drag = Drag();
+    if (g_helpOpen) {  // a click puts the list away, and does nothing else
+        ToggleHelp();
+        return;
+    }
     g_pressBtn = HitButton((float)x, (float)y);
     if (g_pressBtn != B_NONE || HitThumb((float)x, (float)y) >= 0 || OverUi((float)x, (float)y)) {
         g.needsRedraw = true;
@@ -2350,6 +2436,10 @@ void OnMouseUp(int x, int y) {
 }
 
 void OnDoubleClick(int x, int y) {
+    if (g_helpOpen) {
+        ToggleHelp();
+        return;
+    }
     g_drag.down = true;
     g_drag.ignoreUp = true;
     SetCapture(g.hwnd);
@@ -2367,24 +2457,15 @@ void OnDoubleClick(int x, int y) {
 
 // ---------------------------------------------------------------- keyboard
 
-enum : uint8_t { M_CTRL = 1, M_ALT = 2, M_SHIFT = 4 };
-
-// One table drives both the keyboard and the shortcuts list (F1).
-struct KeyDef {
-    uint8_t vk, vkLast;   // a key, or a range of keys; 0 for rows that exist only to be listed
-    uint8_t mods;         // Ctrl and Alt must match exactly; Shift only has to be down when M_SHIFT is set
-    void (*run)(UINT vk);
-    const wchar_t* keys;  // left column of the list; null on rows that continue the one above, and on headings
-    const wchar_t* what;  // right column; a heading when run and keys are null
-};
-
 void KeyEscape(UINT) {
-    if (g_slideshow) ToggleSlideshow();
+    if (g_helpOpen) ToggleHelp();
+    else if (g_slideshow) ToggleSlideshow();
     else if (g_infoOpen) ToggleInfo();
     else Close();
 }
 void KeyClose(UINT) { Close(); }
 void KeyInfo(UINT) { ToggleInfo(); }
+void KeyHelp(UINT) { ToggleHelp(); }
 void KeyDelete(UINT) { DeleteCurrent(); }
 void KeyUndo(UINT) { UndoDelete(); }
 void KeyCopy(UINT) { CopyCurrent(); }
@@ -2468,9 +2549,12 @@ const KeyDef kKeys[] = {
     {'Z', 'Z', M_CTRL, KeyUndo, nullptr, nullptr},
 
     {0, 0, 0, nullptr, nullptr, L"Other"},
+    {VK_F1, VK_F1, 0, KeyHelp, L"F1", L"This list"},
     {VK_ESCAPE, VK_ESCAPE, 0, KeyEscape, L"Esc   Ctrl+W", L"Close"},
     {'W', 'W', M_CTRL, KeyClose, nullptr, nullptr},
 };
+
+const size_t kKeyCount = sizeof(kKeys) / sizeof(kKeys[0]);
 
 void OnKey(WPARAM vk) {
     const uint8_t mods = (GetKeyState(VK_CONTROL) < 0 ? M_CTRL : 0) | (GetKeyState(VK_MENU) < 0 ? M_ALT : 0);
