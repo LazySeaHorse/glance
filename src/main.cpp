@@ -178,6 +178,7 @@ Spring g_strip{0.38, 0.9, 0.3};      // filmstrip scroll position (layout units)
 Spring g_stripK{0.24, 0.92, 0.002};   // filmstrip scale: compact <-> full, follows the pointer
 bool g_stripSnapped = false;
 const float kBgAlpha = 0.88f;
+const double kMinZoomOfFit = 0.1;  // how far you can zoom out, relative to the fitted size
 
 int g_animIdx = 0;
 double g_animNext = 0;
@@ -719,7 +720,11 @@ void ZoomTo(double nz, double cx, double cy, double r = 0.3, double d = 0.9) {
     Entry* e = Cur();
     if (!e || !e->info || !g_view.appeared) return;
     const double fit = FitZoom(*e);
-    nz = std::clamp(nz, fit, std::max(fit, 20.0));
+    const double cur = g_view.zoom.target;
+    // Passing through the fitted size stops there once (a detent), so a fast
+    // scroll out of a zoomed photo lands on "fit" instead of flying past it.
+    if ((cur > fit * 1.001 && nz < fit) || (cur < fit * 0.999 && nz > fit)) nz = fit;
+    nz = std::clamp(nz, fit * kMinZoomOfFit, std::max(fit, 20.0));
     if (std::fabs(nz - fit) < fit * 0.015) nz = fit;
     const double Cx = cx - g.W / 2.0, Cy = cy - g.H / 2.0;
     const double z = g_view.zoom.x;
