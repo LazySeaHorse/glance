@@ -2,7 +2,14 @@
 
 A fast, fluid photo viewer for Windows in the spirit of the old Picasa Photo Viewer: it opens over a dimmed desktop, shows the photo almost immediately, and everything moves with soft, slightly springy, Apple-style animation.
 
-It is a single ~1 MB `Glance.exe` with no installer and no runtime.
+It is a single ~430 KB `Glance.exe` with no installer and no runtime.
+
+## Download
+
+- **Latest build** (updated on every change to `main`): [Glance.exe](https://github.com/LazySeaHorse/glance/releases/download/latest/Glance.exe)
+- **Numbered releases:** [Releases page](https://github.com/LazySeaHorse/glance/releases)
+
+Windows SmartScreen will warn that the file isn't signed: *More info → Run anyway*. Each release also carries a `Glance.exe.sha256` checksum.
 
 ## Using it
 
@@ -17,12 +24,16 @@ It is a single ~1 MB `Glance.exe` with no installer and no runtime.
 |---|---|---|
 | Next / previous | swipe (drag) left/right, side mouse buttons, filmstrip | → ← / Page Down Page Up / Space / Backspace |
 | First / last | | Home / End |
-| Zoom | scroll wheel (zooms where the pointer is) | + / − |
+| Zoom in / out | scroll wheel (zooms where the pointer is) | + / − |
 | Fit / 100% | double-click toggles | 0 / 1 |
 | Pan when zoomed | drag (flicks keep coasting) | ↑ ↓ |
 | Rotate | ↺ ↻ buttons | R (clockwise), L or Shift+R (counter-clockwise), [ ] |
 | Slideshow | ▶ button | S or F5; Esc stops |
 | Close | click the dark background, right-click, × button | Esc, Ctrl+W, Alt+F4 |
+
+You can zoom out to a tenth of the fitted size. Zooming in or out through the fitted size pauses there for one wheel notch, so it's easy to land on it exactly.
+
+The filmstrip sits small at the bottom and grows to full size as the pointer moves towards it, like the macOS Dock. It and the toolbar fade away after a couple of seconds without mouse movement.
 
 Rotation is view-only for now; it doesn't change the file.
 
@@ -57,6 +68,7 @@ The values that shape the feel are grouped at the call sites in `src/main.cpp`:
 | Open (photo grows in) | `TryAppear`, `APPEAR_OPEN` | 0.50 / 0.78 |
 | Next/previous slide | `TryAppear`, `APPEAR_SLIDE`; `PushGhost` | 0.42 / 0.90 |
 | Zoom and pan (wheel) | `ZoomTo` | 0.30 / 0.90 |
+| Filmstrip grow/shrink | `g_stripK` | 0.24 / 0.92 |
 | Flick coasting | `OnMouseUp` | 0.55 / 0.92 |
 | Rotate | `Rotate` | 0.48 / 0.78 |
 | Close | `Close` | 0.20–0.30 / 1.0 |
@@ -68,7 +80,19 @@ On Linux (Ubuntu/Debian):
 
 ```
 sudo apt install mingw-w64
-./build.sh          # -> build/Glance.exe
+./build.sh                         # -> build/Glance.exe, version from ./VERSION
+GLANCE_VERSION=0.3.0 ./build.sh    # stamp a specific version
+```
+
+Builds are reproducible: the same sources and compiler give a byte-identical `Glance.exe`.
+
+### On GitHub
+
+`.github/workflows/build.yml` builds on every push and pull request (the `.exe` is attached to each run as an artifact). A push to `main` refreshes the rolling **latest** pre-release. To publish a numbered release, bump `VERSION`, commit, then tag and push:
+
+```
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 `tools/make_icon.py` regenerates the icon; `tools/make_test_images.py` makes a folder of test photos (various formats, EXIF rotations, a panorama, a broken file); `tools/wine_run.sh` drives the viewer under Wine on a virtual display and takes screenshots.
