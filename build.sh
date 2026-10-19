@@ -24,7 +24,7 @@ H
 $WINDRES -I res -I build res/glance.rc -O coff -o build/glance.res.o
 
 # --no-insert-timestamp: identical sources give a byte-identical exe.
-$CXX -std=c++17 -Os -municode -mwindows -static -s -Wl,--no-insert-timestamp \
+$CXX -std=c++17 -Os -municode -mwindows -static -s -ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,--no-insert-timestamp \
   -Wall -Wno-unknown-pragmas -Wno-missing-braces \
   -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -Ibuild \
   src/main.cpp src/loader.cpp src/fileops.cpp build/glance.res.o \
