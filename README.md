@@ -2,7 +2,7 @@
 
 A fast, fluid photo viewer for Windows in the spirit of the old Picasa Photo Viewer: it opens over a dimmed desktop, shows the photo almost immediately, and everything moves with soft, slightly springy, Apple-style animation.
 
-It is a single ~430 KB `Glance.exe` with no installer and no runtime.
+It is a single ~500 KB `Glance.exe` with no installer and no runtime.
 
 ## Download
 
@@ -22,18 +22,30 @@ Windows SmartScreen will warn that the file isn't signed: *More info → Run any
 
 | Action | Mouse | Keyboard |
 |---|---|---|
-| Next / previous | swipe (drag) left/right, side mouse buttons, filmstrip | → ← / Page Down Page Up / Space / Backspace |
+| Next / previous | swipe (drag) left/right, two-finger swipe on a touchpad, side mouse buttons, filmstrip | → ← / Page Down Page Up / Space / Backspace |
 | First / last | | Home / End |
-| Zoom in / out | scroll wheel (zooms where the pointer is) | + / − |
+| Zoom in / out | scroll wheel or touchpad pinch (zooms where the pointer is) | + / − |
 | Fit / 100% | double-click toggles | 0 / 1 |
-| Pan when zoomed | drag (flicks keep coasting) | ↑ ↓ |
+| Pan when zoomed | drag (flicks keep coasting), two fingers on a touchpad | ↑ ↓ |
 | Rotate | ↺ ↻ buttons | R (clockwise), L or Shift+R (counter-clockwise), [ ] |
 | Slideshow | ▶ button | S or F5; Esc stops |
+| Photo info | | I |
+| Delete / undo | | Delete / Ctrl+Z |
+| Copy | | Ctrl+C |
+| Show in Explorer | | Ctrl+E |
 | Close | click the dark background, right-click, × button | Esc, Ctrl+W, Alt+F4 |
 
 You can zoom out to a tenth of the fitted size. Zooming in or out through the fitted size pauses there for one wheel notch, so it's easy to land on it exactly.
 
 The filmstrip sits small at the bottom and grows to full size as the pointer moves towards it, like the macOS Dock. It and the toolbar fade away after a couple of seconds without mouse movement.
+
+**Photo info** (I) shows when it was taken, camera, lens, exposure, focal length, size, file size and folder. It stays open as you browse; I or Esc closes it.
+
+**Delete** hides the photo at once and really deletes it a few seconds later, so **Ctrl+Z** can bring it back in the meantime (several deletes undo in reverse order). The file goes to the Recycle Bin; if its drive has none or it's switched off, it's deleted permanently, as Picasa did, and the message says so. Anything still pending is deleted when you close Glance.
+
+**Copy** puts the photo on the clipboard twice over: as the file (paste into Explorer, mail or a chat app to attach the original) and as a picture turned the way you see it (paste into Word, Paint or an image editor).
+
+**Touchpads:** on a precision touchpad, two fingers swipe between photos or pan a zoomed one, and pinching zooms. A mouse wheel still zooms.
 
 Rotation is view-only for now; it doesn't change the file.
 
@@ -56,6 +68,9 @@ Photos tagged with a wide-gamut colour profile are converted to sRGB as they're 
 5. **Everything is drawn on the GPU** (Direct2D on Direct3D 11) through DirectComposition, so the dimmed desktop behind the photo is live and transparent rather than a screenshot.
 6. **Nothing runs when nothing moves.** The render loop sleeps between interactions (0% CPU while you look at a photo) and, while animating, wakes on your display's refresh and samples every motion at the moment the frame will be shown.
 7. **A second launch costs nothing.** If Glance is already open, a new launch just passes the file to it and exits.
+8. **The filmstrip borrows Explorer's thumbnails.** If Explorer has shown a folder before, Windows already has thumbnails for it on disk; Glance asks for those first and only decodes photos Windows hasn't seen.
+9. **Work you've moved past is dropped.** Decodes run in short strips; when you flick past a photo, its unfinished decode stops, and background work steps aside the moment the photo on screen needs a worker.
+10. **Huge photos stream in as tiles.** Zooming past screen resolution decodes the full image top to bottom into 512-pixel tiles that appear as they're ready. Only one strip is held in memory at a time, and images wider or taller than the GPU's 16,384-pixel limit show at true full resolution instead of being shrunk. Above 160 megapixels the "full" level is decoded smaller, to keep GPU memory reasonable.
 
 ## Animations
 
@@ -115,7 +130,8 @@ Set the environment variable `GLANCE_TRACE=1` (or pass `--trace`) and Glance app
 ## Code map
 
 - `src/main.cpp` — window, GPU setup, view state, input, animation, drawing, filmstrip, file list, "Open with" registration.
-- `src/loader.cpp` — WIC decoding on worker threads, preview/scaled/full decode levels, EXIF orientation, codec discovery.
+- `src/loader.cpp` — WIC decoding on worker threads: Windows thumbnail cache, preview/screen/full (tiled) levels, cancellation and priorities, EXIF and photo info, GIF frames, colour management, codec discovery.
+- `src/fileops.cpp` — delete (Recycle Bin or permanent), Show in Explorer, clipboard.
 - `src/spring.h` — the spring.
 - `src/com.h` — a tiny COM smart pointer.
 - `res/` — icon, manifest (per-monitor DPI aware), version info.
@@ -129,3 +145,4 @@ It was built and exercised under Wine on Linux, which can't show DirectCompositi
 - HEIC and RAW orientation: Glance assumes the Windows HEIF decoder already rotates pixels itself. If HEIC photos appear sideways, that assumption is wrong.
 - Colour management: Wine doesn't implement colour profiles, so this was only checked by reading the code. A Display P3 or Adobe RGB photo should look the same as in the Windows Photos app.
 - High-DPI (125–200%) layout of the controls and filmstrip.
+- Real precision-touchpad gestures (tested by replaying the messages a touchpad sends) and the Windows thumbnail cache (Wine doesn't provide one).
