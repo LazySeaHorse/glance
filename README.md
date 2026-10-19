@@ -24,6 +24,7 @@ Windows SmartScreen will warn that the file isn't signed: *More info → Run any
 |---|---|---|
 | Next / previous | swipe (drag) left/right, two-finger swipe on a touchpad, side mouse buttons, filmstrip | → ← / Page Down Page Up / Space / Backspace |
 | First / last | | Home / End |
+| Sort the folder | | N by name, D by date modified; the same key again reverses |
 | Jump to photo 1–10 | | 1–9, 0 (the tenth); no animation |
 | Zoom in / out | scroll wheel or touchpad pinch (zooms where the pointer is) | + / − |
 | Fit / 100% | double-click toggles | Ctrl+0 / Ctrl+1 |
@@ -52,7 +53,9 @@ The filmstrip sits small at the bottom and grows to full size as the pointer mov
 
 **Copy** puts the photo on the clipboard twice over: as the file (paste into Explorer, mail or a chat app to attach the original) and as a picture turned the way you see it (paste into Word, Paint or an image editor).
 
-**Jumping** (1–9 and 0) goes straight to the first ten photos in the folder, with no slide or fade, which is handy for flicking between photos to compare them. Small previews of those ten are kept ready. With fewer than ten photos the extra keys do nothing.
+**Order:** photos are shown in the order you choose, not Explorer's. **N** sorts by name (A to Z, numbers compared as numbers, so `img2` comes before `img10`) and **D** by date modified (newest first). Pressing the same key again reverses it. Photos with the same date fall back to name order. The choice is remembered between launches (`HKEY_CURRENT_USER\Software\Glance`). The photo you're looking at stays put; it's the filmstrip that moves.
+
+**Jumping** (1–9 and 0) goes straight to the first ten photos in the folder (in the current order), with no slide or fade, which is handy for flicking between photos to compare them. Small previews of those ten are kept ready. With fewer than ten photos the extra keys do nothing.
 
 **Pixel grid:** above 400% zoom, real pixels are drawn as sharp squares instead of being smoothed.
 
@@ -166,7 +169,7 @@ It was built and exercised under Wine on Linux, which can't show DirectCompositi
 - Colour management: Wine doesn't implement colour profiles, so this was only checked by reading the code. A Display P3 or Adobe RGB photo should look the same as in the Windows Photos app.
 - High-DPI (125–200%) layout of the controls and filmstrip.
 - The Windows thumbnail cache (Wine doesn't provide one).
-- Everything added after 0.3.0, which was only compiled, never run (the machine it was written on can't run Windows programs): F1 list layout, jumping with 1–9 and 0, pixel grid, colour picker (the one-pixel GPU read-back in particular), rename (typing, selection, the extension staying fixed, a file still open while it's renamed, Ctrl+Z), and Ctrl+Shift+C / Ctrl+Alt+C. Typing a name with an input method editor (Chinese, Japanese, Korean) is untested too.
+- Everything added after 0.3.0, which was only compiled, never run (the machine it was written on can't run Windows programs): N / D sorting and remembering it, F1 list layout, jumping with 1–9 and 0, pixel grid, colour picker (the one-pixel GPU read-back in particular), rename (typing, selection, the extension staying fixed, a file still open while it's renamed, Ctrl+Z), and Ctrl+Shift+C / Ctrl+Alt+C. Typing a name with an input method editor (Chinese, Japanese, Korean) is untested too.
 - Touchpad two-finger sideways swipe: see below.
 
 ## Verified on real Windows
