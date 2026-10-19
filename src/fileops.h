@@ -33,3 +33,11 @@ bool SetClipboard(HWND owner, const ClipData& data);
 
 // Puts plain text on the clipboard.
 bool SetClipboardText(HWND owner, const std::wstring& text);
+
+// The text on the clipboard, or empty.
+std::wstring GetClipboardText(HWND owner);
+
+// Renames a file in place. Returns 0, or the Win32 error (ERROR_ALREADY_EXISTS when the
+// name is taken: nothing is ever overwritten). Waits briefly if the file is in use.
+// Call from a worker thread.
+DWORD RenameForUser(const std::wstring& from, const std::wstring& to);

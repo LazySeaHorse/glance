@@ -38,6 +38,7 @@
 #include "com.h"
 #include "fileops.h"
 #include "loader.h"
+#include "rules.h"
 #include "spring.h"
 #include "version.h"
 
@@ -47,6 +48,7 @@ constexpr UINT WM_APP_DECODED = WM_APP + 1;
 constexpr UINT WM_APP_LIST = WM_APP + 2;
 constexpr UINT WM_APP_COPIED = WM_APP + 3;    // lParam: ClipData* ready to go on the clipboard
 constexpr UINT WM_APP_RECYCLED = WM_APP + 4;  // wParam: success, lParam: std::wstring* path
+constexpr UINT WM_APP_RENAMED = WM_APP + 5;   // lParam: RenameMsg*
 constexpr UINT_PTR TIMER_TICK = 1;
 const wchar_t* kAppName = L"Glance";
 constexpr ULONG_PTR kCopyDataOpen = 0x474C4E43;  // 'GLNC
@@ -228,6 +230,27 @@ struct Picker {
     uint8_t r = 0, g = 0, b = 0, a = 255;  // straight (not premultiplied) sRGB, as displayed
     ComPtr<ID2D1Bitmap1> stage;            // 1x1 and CPU-readable; made on first use
 } g_pick;
+// Renaming (F2): a one-line editor in the info panel's title row. Only the part
+// before the extension can change.
+struct TextEdit {
+    bool active = false, openedInfo = false;
+    std::wstring text, ext;
+    int caret = 0, anchor = 0;  // the selection is between them
+    float scroll = 0;           // how far the text is shifted left to keep the caret in view
+    float originX = 0, originY = 0;
+    double blink = 0;           // when the caret last moved (it shows solid, then blinks)
+    D2D1_RECT_F box{};
+} g_edit;
+struct Renamed {
+    std::wstring from, to;
+    double at;
+};
+std::vector<Renamed> g_renamed;  // newest last; Ctrl+Z renames back, in step with pending deletes
+struct RenameMsg {
+    std::wstring from, to;
+    DWORD err;
+    bool undo;
+};
 struct Touchpad {
     bool seenSmallH = false;  // has sent sub-notch horizontal scrolls: a precision touchpad
     bool swiping = false;
@@ -755,6 +778,8 @@ void PushGhost(int dir, bool slide) {
     if (g_ghosts.size() > 3) g_ghosts.erase(g_ghosts.begin());
 }
 
+void EndRename(bool commit);
+
 void Navigate(int idx, int mode) {
     const int n = (int)g_files.size();
     if (n == 0 || g_closing) return;
@@ -767,6 +792,7 @@ void Navigate(int idx, int mode) {
         return;
     }
     if (idx == g_cur) return;
+    EndRename(false);
     if (g_drag.down) {  // e.g. a key pressed mid-drag
         g_drag = Drag();
         g_pressBtn = B_NONE;
@@ -795,6 +821,7 @@ void Navigate(int idx, int mode) {
 
 void Close() {
     if (g_closing) return;
+    EndRename(false);
     g_closing = true;
     g_closeStart = Now();
     g_slideshow = false;
@@ -1615,6 +1642,58 @@ void DrawToast() {
     g.ctx->DrawTextLayout(D2D1::Point2F(r.left + padX, r.top + padY), lay.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
 }
 
+// The rename field: the stem is editable text with a selection and a caret,
+// the extension sits dimmed right after it.
+void DrawEditField(float x, float y, float w, float h, IDWriteTextLayout* stem, IDWriteTextLayout* ext, float a) {
+    if (!stem || !ext) return;
+    const float s = g.s, pad = 7 * s;
+    TextEdit& t = g_edit;
+    t.box = D2D1::RectF(x, y, x + w, y + h);
+    Color(1, 1, 1, 0.1f * a);
+    g.ctx->FillRoundedRectangle(D2D1::RoundedRect(t.box, 6 * s, 6 * s), g.brush.get());
+    Color(1, 1, 1, 0.3f * a);
+    g.ctx->DrawRoundedRectangle(D2D1::RoundedRect(t.box, 6 * s, 6 * s), g.brush.get(), 1.0f, nullptr);
+
+    const float stemW = LayoutWidth(stem), extW = LayoutWidth(ext);
+    const float viewW = std::max(20 * s, w - 2 * pad - extW);
+    float caretX = 0, caretY = 0;
+    DWRITE_HIT_TEST_METRICS hm{};
+    stem->HitTestTextPosition((UINT32)t.caret, FALSE, &caretX, &caretY, &hm);
+    if (caretX - t.scroll > viewW - 2 * s) t.scroll = caretX - viewW + 2 * s;  // keep the caret in view
+    if (caretX - t.scroll < 0) t.scroll = caretX;
+    t.scroll = std::clamp(t.scroll, 0.0f, std::max(0.0f, stemW - viewW + 2 * s));
+    const float lineH = LayoutHeight(stem) > 0 ? LayoutHeight(stem) : 19 * s;
+    t.originX = x + pad - t.scroll;
+    t.originY = y + (h - lineH) / 2;
+
+    g.ctx->PushAxisAlignedClip(D2D1::RectF(x + pad, y, x + pad + viewW, y + h), D2D1_ANTIALIAS_MODE_ALIASED);
+    const int lo = std::min(t.caret, t.anchor), hi = std::max(t.caret, t.anchor);
+    if (lo < hi) {
+        UINT32 count = 0;
+        stem->HitTestTextRange((UINT32)lo, (UINT32)(hi - lo), t.originX, t.originY, nullptr, 0, &count);
+        std::vector<DWRITE_HIT_TEST_METRICS> rects(count);
+        if (count && SUCCEEDED(stem->HitTestTextRange((UINT32)lo, (UINT32)(hi - lo), t.originX, t.originY, rects.data(),
+                                                       count, &count))) {
+            g.brush->SetColor(D2D1::ColorF(0.3f, 0.55f, 1.0f, 0.5f * a));
+            for (UINT32 i = 0; i < count; i++)
+                g.ctx->FillRectangle(D2D1::RectF(rects[i].left, rects[i].top, rects[i].left + rects[i].width,
+                                                 rects[i].top + rects[i].height),
+                                     g.brush.get());
+        }
+    }
+    Color(1, 1, 1, 0.96f * a);
+    g.ctx->DrawTextLayout(D2D1::Point2F(t.originX, t.originY), stem, g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+    if (std::fmod(Now() - t.blink, 1.06) < 0.53) {
+        const float cx = t.originX + caretX;
+        Color(1, 1, 1, 0.95f * a);
+        g.ctx->FillRectangle(D2D1::RectF(cx, t.originY, cx + std::max(1.0f, 1.5f * s), t.originY + lineH), g.brush.get());
+    }
+    g.ctx->PopAxisAlignedClip();
+    Color(1, 1, 1, 0.45f * a);
+    g.ctx->DrawTextLayout(D2D1::Point2F(x + pad + std::min(stemW, viewW) + 1, t.originY), ext, g.brush.get(),
+                          D2D1_DRAW_TEXT_OPTIONS_NONE);
+}
+
 void DrawInfoPanel() {
     const float a = (float)std::clamp(g_info.x, 0.0, 1.0) * (float)std::clamp(g_bg.x, 0.0, 1.0);
     if (a < 0.003f) return;
@@ -1631,8 +1710,17 @@ void DrawInfoPanel() {
         float h;
     };
     std::vector<Row> rows;
-    auto title = Layout(FileName(g_curPath), g.fontSmallBold.get(), pw - 2 * pad, true);
-    float h = pad + LayoutHeight(title.get()) + 12 * s;
+    ComPtr<IDWriteTextLayout> title, stem, ext;
+    float titleH;
+    if (g_edit.active) {
+        stem = Layout(g_edit.text, g.fontSmallBold.get(), 4000.f, false);
+        ext = Layout(g_edit.ext, g.fontSmallBold.get(), 4000.f, false);
+        titleH = std::max(LayoutHeight(stem.get()), 19 * s) + 10 * s;
+    } else {
+        title = Layout(FileName(g_curPath), g.fontSmallBold.get(), pw - 2 * pad, true);
+        titleH = LayoutHeight(title.get());
+    }
+    float h = pad + titleH + 12 * s;
     if (!e->metaDone) {
         Row r{{}, Layout(L"Reading…", g.fontSmall.get(), valueW, true), 0};
         r.h = LayoutHeight(r.value.get());
@@ -1660,8 +1748,9 @@ void DrawInfoPanel() {
     g.ctx->DrawRoundedRectangle(D2D1::RoundedRect(box, 14 * s, 14 * s), g.brush.get(), 1.0f, nullptr);
     float cy = y + pad;
     Color(1, 1, 1, 0.96f * a);
-    if (title) g.ctx->DrawTextLayout(D2D1::Point2F(x + pad, cy), title.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-    cy += LayoutHeight(title.get()) + 12 * s;
+    if (g_edit.active) DrawEditField(x + pad, cy, pw - 2 * pad, titleH, stem.get(), ext.get(), a);
+    else if (title) g.ctx->DrawTextLayout(D2D1::Point2F(x + pad, cy), title.get(), g.brush.get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+    cy += titleH + 12 * s;
     for (auto& r : rows) {
         if (r.label) {
             Color(1, 1, 1, 0.5f * a);
@@ -1783,10 +1872,9 @@ bool SamplePick(int px, int py) {
         return false;
     const uint8_t* q = m.bits;  // premultiplied BGRA
     const unsigned a = q[3];
-    auto straight = [a](unsigned c) { return (uint8_t)(a ? std::min(255u, (c * 255 + a / 2) / a) : 0u); };
-    g_pick.b = straight(q[0]);
-    g_pick.g = straight(q[1]);
-    g_pick.r = straight(q[2]);
+    g_pick.b = Unpremultiply(q[0], a);
+    g_pick.g = Unpremultiply(q[1], a);
+    g_pick.r = Unpremultiply(q[2], a);
     g_pick.a = (uint8_t)a;
     g_pick.stage->Unmap();
     g_pick.valid = true;
@@ -2047,6 +2135,7 @@ std::wstring FullPath(const std::wstring& p) {
 
 void OpenFile(const std::wstring& path, bool first) {
     const std::wstring p = FullPath(path);
+    EndRename(false);
     if (!first) {
         PushGhost(1, false);
         if (!g_ghosts.empty()) g_ghosts.back().alpha.params(0.28, 1.0);  // quick fade-out of the old photo
@@ -2311,6 +2400,212 @@ void ToggleHelp() {
     g.needsRedraw = true;
 }
 
+// ---------------------------------------------------------------- rename
+
+void StartRename(const std::wstring& from, const std::wstring& to, bool undo) {
+    HWND hwnd = g.hwnd;
+    std::thread([from, to, undo, hwnd] {  // waits for files still in use, so never on the UI thread
+        auto* m = new RenameMsg{from, to, RenameForUser(from, to), undo};
+        if (!PostMessageW(hwnd, WM_APP_RENAMED, 0, (LPARAM)m)) delete m;
+    }).detach();
+}
+
+void BeginRename() {
+    if (g_edit.active || g_closing || g_curPath.empty()) return;
+    SplitName(FileName(g_curPath), g_edit.text, g_edit.ext);
+    g_slideshow = false;
+    g_edit.active = true;
+    g_edit.openedInfo = !g_infoOpen;
+    g_edit.anchor = 0;
+    g_edit.caret = (int)g_edit.text.size();  // the whole name starts selected
+    g_edit.scroll = 0;
+    g_edit.blink = Now();
+    if (g_edit.openedInfo) ToggleInfo();
+    g.needsRedraw = true;
+}
+
+// Enter commits (staying in the editor if the name isn't usable), Esc and clicking away from the photo cancel.
+void EndRename(bool commit) {
+    if (!g_edit.active) return;
+    const std::wstring stem = TrimSpaces(g_edit.text);
+    if (commit) {
+        if (const wchar_t* problem = NameProblem(stem)) {
+            ShowToast(problem, 3.0);
+            return;
+        }
+    }
+    g_edit.active = false;
+    if (g_edit.openedInfo && g_infoOpen) ToggleInfo();
+    g.needsRedraw = true;
+    if (!commit) return;
+    const std::wstring to = DirName(g_curPath) + L"\\" + stem + g_edit.ext;
+    if (to != g_curPath) StartRename(g_curPath, to, false);
+}
+
+void EditReplace(const std::wstring& with) {  // swaps the selection for `with`
+    TextEdit& t = g_edit;
+    const int lo = std::min(t.caret, t.anchor), hi = std::max(t.caret, t.anchor);
+    t.text.replace(lo, hi - lo, with);
+    t.caret = t.anchor = lo + (int)with.size();
+    t.blink = Now();
+    g.needsRedraw = true;
+}
+
+// Carets move by whole characters, so they never land inside a surrogate pair.
+int EditPrev(int i) {
+    const std::wstring& t = g_edit.text;
+    if (i <= 0) return 0;
+    return (i >= 2 && t[i - 1] >= 0xDC00 && t[i - 1] <= 0xDFFF && t[i - 2] >= 0xD800 && t[i - 2] <= 0xDBFF) ? i - 2 : i - 1;
+}
+int EditNext(int i) {
+    const std::wstring& t = g_edit.text;
+    const int n = (int)t.size();
+    if (i >= n) return n;
+    return (i + 1 < n && t[i] >= 0xD800 && t[i] <= 0xDBFF && t[i + 1] >= 0xDC00 && t[i + 1] <= 0xDFFF) ? i + 2 : i + 1;
+}
+
+void EditKey(UINT vk) {
+    TextEdit& t = g_edit;
+    const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    const int lo = std::min(t.caret, t.anchor), hi = std::max(t.caret, t.anchor);
+    auto moveTo = [&](int pos) {
+        t.caret = pos;
+        if (!shift) t.anchor = pos;
+    };
+    switch (vk) {
+        case VK_RETURN: EndRename(true); return;
+        case VK_ESCAPE: EndRename(false); return;
+        case VK_LEFT: moveTo(!shift && lo != hi ? lo : EditPrev(t.caret)); break;
+        case VK_RIGHT: moveTo(!shift && lo != hi ? hi : EditNext(t.caret)); break;
+        case VK_HOME: moveTo(0); break;
+        case VK_END: moveTo((int)t.text.size()); break;
+        case VK_BACK:
+            if (lo == hi) {
+                t.anchor = lo;
+                t.caret = EditPrev(lo);
+            }
+            EditReplace(L"");
+            break;
+        case VK_DELETE:
+            if (lo == hi) {
+                t.anchor = hi;
+                t.caret = EditNext(hi);
+            }
+            EditReplace(L"");
+            break;
+        case 'A':
+            if (ctrl) {
+                t.anchor = 0;
+                t.caret = (int)t.text.size();
+            }
+            break;
+        case 'C': case 'X':
+            if (ctrl && lo != hi) {
+                SetClipboardText(g.hwnd, t.text.substr(lo, hi - lo));
+                if (vk == 'X') EditReplace(L"");
+            }
+            break;
+        case 'V':
+            if (ctrl) {
+                std::wstring clip;
+                for (wchar_t c : GetClipboardText(g.hwnd))
+                    if (NameCharOk(c)) clip += c;  // quietly drops line breaks and anything not allowed in a name
+                EditReplace(clip);
+            }
+            break;
+        default: return;
+    }
+    t.blink = Now();
+    g.needsRedraw = true;
+}
+
+void EditChar(wchar_t c) {
+    if (c < 32 || c == 127) return;  // Enter, Esc, Backspace and Ctrl+letters arrive here too
+    if (!NameCharOk(c)) {
+        ShowToast(NameProblem(std::wstring(1, c)), 2.5);
+        return;
+    }
+    EditReplace(std::wstring(1, c));
+}
+
+void EditClick(int x, int y) {
+    auto lay = Layout(g_edit.text, g.fontSmallBold.get(), 4000.f, false);
+    if (!lay) return;
+    BOOL trailing = FALSE, inside = FALSE;
+    DWRITE_HIT_TEST_METRICS m{};
+    lay->HitTestPoint((float)x - g_edit.originX, (float)y - g_edit.originY, &trailing, &inside, &m);
+    const int pos = (int)m.textPosition + (trailing ? (int)m.length : 0);
+    g_edit.caret = pos;
+    if (GetKeyState(VK_SHIFT) >= 0) g_edit.anchor = pos;
+    g_edit.blink = Now();
+    g.needsRedraw = true;
+}
+
+const wchar_t* RenameProblem(DWORD err) {
+    switch (err) {
+        case ERROR_ALREADY_EXISTS: case ERROR_FILE_EXISTS: return L"There’s already a file with that name";
+        case ERROR_SHARING_VIOLATION: case ERROR_LOCK_VIOLATION: return L"That photo is open in another program";
+        case ERROR_ACCESS_DENIED: case ERROR_WRITE_PROTECT: return L"Glance isn’t allowed to rename that photo";
+        case ERROR_INVALID_NAME: case ERROR_FILENAME_EXCED_RANGE: case ERROR_BAD_PATHNAME: return L"That name isn’t allowed";
+        case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: return L"That photo has moved or been deleted";
+        default: return L"Couldn’t rename the photo";
+    }
+}
+
+void OnRenamed(RenameMsg* msg) {
+    std::unique_ptr<RenameMsg> m(msg);
+    Trace(L"rename %ls -> %ls: %lu", FileName(m->from).c_str(), FileName(m->to).c_str(), m->err);
+    if (m->err) {
+        ShowToast(RenameProblem(m->err), 3.0);
+        const bool nameTaken = m->err == ERROR_ALREADY_EXISTS || m->err == ERROR_FILE_EXISTS ||
+                               m->err == ERROR_INVALID_NAME || m->err == ERROR_FILENAME_EXCED_RANGE;
+        if (nameTaken && !m->undo && g_curPath == m->from && !g_edit.active) {  // let them fix the name
+            BeginRename();
+            std::wstring ext;
+            SplitName(FileName(m->to), g_edit.text, ext);
+            g_edit.anchor = 0;
+            g_edit.caret = (int)g_edit.text.size();
+        }
+        return;
+    }
+    // Move everything we know about the photo (decoded pictures, info) to its new name.
+    auto node = g_entries.extract(m->from);
+    g_entries.erase(m->to);
+    if (node) {
+        node.key() = m->to;
+        g_entries.insert(std::move(node));
+    }
+    auto at = std::find(g_files.begin(), g_files.end(), m->from);
+    if (at != g_files.end()) {
+        g_files.erase(at);
+        g_files.insert(std::lower_bound(g_files.begin(), g_files.end(), m->to, ByName), m->to);
+    }
+    const bool wasCurrent = g_curPath == m->from;
+    if (wasCurrent) g_curPath = m->to;
+    RebuildIndex();
+    auto ci = g_fileIndex.find(g_curPath);
+    if (ci != g_fileIndex.end()) g_cur = ci->second;
+    if (wasCurrent) SetWindowTextW(g.hwnd, (FileName(g_curPath) + L" - " + kAppName).c_str());
+    if (!m->undo) {
+        g_renamed.push_back({m->from, m->to, Now()});
+        if (g_renamed.size() > 20) g_renamed.erase(g_renamed.begin());
+    }
+    RequestDecodes();  // anything still in flight under the old name is dropped
+    ShowToast((m->undo ? L"Renamed back to " : L"Renamed to ") + FileName(m->to), 2.0);
+}
+
+// Ctrl+Z: whichever of the last delete and the last rename came later.
+void UndoLast() {
+    if (g_closing) return;
+    if (!g_renamed.empty() && (g_pendingDel.empty() || g_renamed.back().at > g_pendingDel.back().at)) {
+        const Renamed r = g_renamed.back();
+        g_renamed.pop_back();
+        StartRename(r.to, r.from, true);
+        return;
+    }
+    UndoDelete();
+}
+
 // Precision touchpads send scroll messages in small steps (not whole 120-unit
 // notches), and Windows can say where input came from. Mice keep wheel = zoom.
 bool FromTouchpad(int delta, bool horizontal) {
@@ -2420,6 +2715,11 @@ void OnMouseDown(int x, int y) {
     g_drag = Drag();
     if (g_helpOpen) {  // a click puts the list away, and does nothing else
         ToggleHelp();
+        return;
+    }
+    if (g_edit.active) {  // inside the field it places the caret; anywhere else it finishes the rename
+        if (InRect(g_edit.box, (float)x, (float)y)) EditClick(x, y);
+        else EndRename(true);
         return;
     }
     g_pressBtn = HitButton((float)x, (float)y);
@@ -2557,6 +2857,10 @@ void OnMouseUp(int x, int y) {
 }
 
 void OnDoubleClick(int x, int y) {
+    if (g_edit.active) {  // the second click of a double-click is just another click
+        OnMouseDown(x, y);
+        return;
+    }
     if (g_helpOpen) {
         ToggleHelp();
         return;
@@ -2594,7 +2898,8 @@ void KeyInfo(UINT) { ToggleInfo(); }
 void KeyHelp(UINT) { ToggleHelp(); }
 void KeyPicker(UINT) { TogglePicker(); }
 void KeyDelete(UINT) { DeleteCurrent(); }
-void KeyUndo(UINT) { UndoDelete(); }
+void KeyUndo(UINT) { UndoLast(); }
+void KeyRename(UINT) { BeginRename(); }
 void KeyCopy(UINT) { CopyCurrent(); }
 void KeyCopyPath(UINT) { CopyPathText(false); }
 void KeyCopyName(UINT) { CopyPathText(true); }
@@ -2670,11 +2975,12 @@ const KeyDef kKeys[] = {
 
     {0, 0, 0, nullptr, nullptr, L"Photo"},
     {'I', 'I', 0, KeyInfo, L"I", L"Photo info"},
+    {VK_F2, VK_F2, 0, KeyRename, L"F2", L"Rename"},
     {'C', 'C', M_CTRL | M_SHIFT, KeyCopyPath, L"Ctrl+Shift+C", L"Copy the path"},
     {'C', 'C', M_CTRL | M_ALT, KeyCopyName, L"Ctrl+Alt+C", L"Copy the file name"},
     {'C', 'C', M_CTRL, KeyCopy, L"Ctrl+C", L"Copy the photo"},
     {'E', 'E', M_CTRL, KeyReveal, L"Ctrl+E", L"Show in Explorer"},
-    {VK_DELETE, VK_DELETE, 0, KeyDelete, L"Delete   Ctrl+Z", L"Delete / undo"},
+    {VK_DELETE, VK_DELETE, 0, KeyDelete, L"Delete   Ctrl+Z", L"Delete / undo (also rename)"},
     {'Z', 'Z', M_CTRL, KeyUndo, nullptr, nullptr},
 
     {0, 0, 0, nullptr, nullptr, L"Other"},
@@ -2686,6 +2992,10 @@ const KeyDef kKeys[] = {
 const size_t kKeyCount = sizeof(kKeys) / sizeof(kKeys[0]);
 
 void OnKey(WPARAM vk) {
+    if (g_edit.active) {  // typing a name: no shortcut may fire
+        EditKey((UINT)vk);
+        return;
+    }
     const uint8_t mods = (GetKeyState(VK_CONTROL) < 0 ? M_CTRL : 0) | (GetKeyState(VK_MENU) < 0 ? M_ALT : 0);
     const bool shift = GetKeyState(VK_SHIFT) < 0;
     for (const KeyDef& k : kKeys) {
@@ -2713,8 +3023,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         case WM_APP_COPIED: OnCopied(reinterpret_cast<ClipData*>(lp)); return 0;
+        case WM_APP_RENAMED: OnRenamed(reinterpret_cast<RenameMsg*>(lp)); return 0;
         case WM_APP_RECYCLED: OnRecycled(wp != 0, reinterpret_cast<std::wstring*>(lp)); return 0;
+        case WM_CHAR:
+            if (g_edit.active) EditChar((wchar_t)wp);
+            return 0;
         case WM_TIMER:
+            if (g_edit.active) g.needsRedraw = true;  // the caret blinks
             CommitDeletes(false);
             SlideshowTick();
             return 0;

@@ -237,6 +237,19 @@ bool SetClipboardText(HWND owner, const std::wstring& text) {
     return ok;
 }
 
+std::wstring GetClipboardText(HWND owner) {
+    std::wstring out;
+    if (!OpenClipboardRetry(owner)) return out;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+            out = p;
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return out;
+}
+
 bool SetClipboard(HWND owner, const ClipData& data) {
     if (!data.ok || !OpenClipboardRetry(owner)) return false;
     EmptyClipboard();
@@ -256,4 +269,19 @@ bool SetClipboard(HWND owner, const ClipData& data) {
     if (!data.png.empty()) PutBytes(RegisterClipboardFormatW(L"PNG"), data.png.data(), data.png.size());
     CloseClipboard();
     return ok;
+}
+
+DWORD RenameForUser(const std::wstring& from, const std::wstring& to) {
+    DWORD err = 0;
+    for (int i = 0; i < 15; i++) {
+        // No REPLACE_EXISTING: a name that's taken is reported, never overwritten.
+        if (MoveFileExW(from.c_str(), to.c_str(), 0)) {
+            SHChangeNotify(SHCNE_RENAMEITEM, SHCNF_PATHW, from.c_str(), to.c_str());
+            return 0;
+        }
+        err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION) break;
+        Sleep(30);  // our own decoder may still have the file open for a moment
+    }
+    return err;
 }
