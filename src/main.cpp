@@ -38,6 +38,7 @@
 #include "com.h"
 #include "loader.h"
 #include "spring.h"
+#include "version.h"
 
 namespace {
 
@@ -2011,7 +2012,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         else if (file.empty()) file = a;
     }
     if (argv) LocalFree(argv);
-    Trace(L"---- start");
+    Trace(L"---- start (Glance %ls)", GV_WSTR);
 
     // Already open? Hand the photo to that window; it shows it instantly.
     if (!file.empty() && !doRegister && !doUnregister) {
