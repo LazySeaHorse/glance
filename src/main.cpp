@@ -179,6 +179,7 @@ struct View {
     Spring alpha{0.25, 1.0, 0.002}, offX{0.4, 0.88, 0.2}, scale{0.45, 0.8, 1e-4};
     Spring upgrade{0.16, 1.0, 0.004};
     bool fitted = true, appeared = false;
+    bool grid = false;  // zoomed far enough in that pixels are drawn as sharp squares
     int mode = APPEAR_OPEN, dir = 1;
     double navTime = 0;
     Bmp shown, prev;
@@ -189,6 +190,7 @@ struct Ghost {
     std::wstring path;
     Bmp bmp;
     int imgW = 0, imgH = 0, orient = 1;
+    bool grid = false;
     double zoom = 1, panX = 0, panY = 0, rot = 0;
     Spring alpha{0.25, 1.0, 0.004}, offX{0.4, 0.9, 0.5}, scale{0.4, 1.0, 1e-4};
 };
@@ -201,6 +203,7 @@ Spring g_stripK{0.24, 0.92, 0.002};   // filmstrip scale: compact <-> full, foll
 bool g_stripSnapped = false;
 const float kBgAlpha = 0.88f;
 const double kMinZoomOfFit = 0.1;  // how far you can zoom out, relative to the fitted size
+const double kGridOn = 4.0, kGridOff = 3.6;  // pixel-grid view starts above 400%, with a gap so it doesn't flicker
 
 // Info panel (I), toast messages, pending deletes, touchpad gestures.
 bool g_infoOpen = false;
@@ -675,6 +678,7 @@ void TryAppear() {
 void ResetView(int mode, int dir) {
     View& v = g_view;
     v.appeared = false;
+    v.grid = false;
     v.mode = mode;
     v.dir = dir;
     v.navTime = Now();
@@ -705,6 +709,7 @@ void PushGhost(int dir, bool slide) {
     gh.imgW = e->w;
     gh.imgH = e->h;
     gh.orient = e->orient;
+    gh.grid = g_view.grid && b->w >= e->w;  // only if what it shows is real pixels, not an upscaled preview
     gh.zoom = g_view.zoom.x;
     gh.panX = g_view.panX.x;
     gh.panY = g_view.panY.x;
@@ -1238,7 +1243,7 @@ ImageXf PhotoTransform(int imgW, int imgH, int orient, bool upright, double rotD
 }
 
 void DrawImage(const Bmp& b, int imgW, int imgH, int orient, double rotDeg, double zoom, double cx, double cy,
-               float alpha, bool hq) {
+               float alpha, bool hq, bool grid = false) {
     if (!b.b || alpha <= 0.002f || imgW <= 0 || imgH <= 0) return;
     const ImageXf x = PhotoTransform(imgW, imgH, orient, b.upright, rotDeg, zoom, cx, cy, hq);
     imgW = x.w;
@@ -1249,6 +1254,7 @@ void DrawImage(const Bmp& b, int imgW, int imgH, int orient, double rotDeg, doub
         D2D1_INTERPOLATION_MODE im = D2D1_INTERPOLATION_MODE_LINEAR;
         if (hq) im = g.hqOk ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC : D2D1_INTERPOLATION_MODE_CUBIC;
         else if (zoom * imgW < b.w * 0.75) im = D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR;
+        if (grid) im = D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
         g.ctx->DrawBitmap(b.b.get(), &dst, alpha, im, nullptr, nullptr);
     } else {
         // Mid-rotation: fill through a bitmap brush so the edges get antialiased.
@@ -1267,7 +1273,7 @@ void DrawImage(const Bmp& b, int imgW, int imgH, int orient, double rotDeg, doub
 
 // Full-resolution tiles over the screen-sized picture. Only tiles that touch
 // the screen are drawn; each fades in as it arrives.
-void DrawTiles(const Entry& e, double rotDeg, double zoom, double cx, double cy, float alpha, bool hq) {
+void DrawTiles(const Entry& e, double rotDeg, double zoom, double cx, double cy, float alpha, bool hq, bool grid) {
     const FullRes& f = e.full;
     if (f.tiles.empty() || f.lw <= 0 || f.lh <= 0) return;
     const ImageXf x = PhotoTransform(e.w, e.h, e.orient, false, rotDeg, zoom, cx, cy, hq);
@@ -1275,7 +1281,8 @@ void DrawTiles(const Entry& e, double rotDeg, double zoom, double cx, double cy,
     const float sx = (float)e.w / f.lw, sy = (float)e.h / f.lh;
     const float ox = -e.w / 2.f, oy = -e.h / 2.f;
     const bool shrinking = zoom * sx < 0.75;  // drawn well below full resolution
-    const D2D1_INTERPOLATION_MODE im = hq ? (g.hqOk ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+    const D2D1_INTERPOLATION_MODE im = grid ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                                       : hq ? (g.hqOk ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
                                                     : D2D1_INTERPOLATION_MODE_CUBIC)
                                           : (shrinking ? D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR
                                                        : D2D1_INTERPOLATION_MODE_LINEAR);
@@ -1312,8 +1319,9 @@ void DrawCurrent(bool hq) {
     if (e->anim.size() > 1) {  // frames replace each other directly; no sharpening crossfade
         v.shown = *b;
         v.prev = Bmp();
+        v.grid = b->w >= e->w && z >= (v.grid ? kGridOff : kGridOn);
         DrawImage(*b, e->w, e->h, e->orient, v.rot.x, z, g.W / 2.0 + v.panX.x + v.offX.x, g.H / 2.0 + v.panY.x,
-                  (float)std::clamp(v.alpha.x, 0.0, 1.0), hq);
+                  (float)std::clamp(v.alpha.x, 0.0, 1.0), hq, v.grid);
         return;
     }
     if (v.shown.b && v.shown.b != b->b && b->w > v.shown.w) {  // sharper version arrived: crossfade
@@ -1325,21 +1333,28 @@ void DrawCurrent(bool hq) {
     const double cx = g.W / 2.0 + v.panX.x + v.offX.x, cy = g.H / 2.0 + v.panY.x;
     const float a = (float)std::clamp(v.alpha.x, 0.0, 1.0);
     const bool still = hq && v.upgrade.settled();
+    // Zoomed past the screen-sized picture: the sharp tiles go on top of it.
+    const bool tiled = !e->full.tiles.empty() && e->w * z > b->w * 1.03;
+    // Past 400% of the real pixels, show them as squares. The smooth picture that
+    // waits under loading tiles (or a small preview) never gets blown up that way.
+    const int finest = tiled ? e->full.lw : b->w;
+    const double zl = z * e->w / finest;  // screen pixels per pixel of the sharpest data on screen
+    v.grid = (tiled || b->w >= e->w) && zl >= (v.grid ? kGridOff : kGridOn);
     if (v.prev.b && !v.upgrade.settled()) {
         DrawImage(v.prev, e->w, e->h, e->orient, v.rot.x, z, cx, cy, a, false);
-        DrawImage(*b, e->w, e->h, e->orient, v.rot.x, z, cx, cy, a * (float)std::clamp(v.upgrade.x, 0.0, 1.0), false);
+        DrawImage(*b, e->w, e->h, e->orient, v.rot.x, z, cx, cy, a * (float)std::clamp(v.upgrade.x, 0.0, 1.0), false,
+                  v.grid && !tiled);
     } else {
-        DrawImage(*b, e->w, e->h, e->orient, v.rot.x, z, cx, cy, a, still);
+        DrawImage(*b, e->w, e->h, e->orient, v.rot.x, z, cx, cy, a, still, v.grid && !tiled);
     }
-    // Zoomed past the screen-sized picture: lay the sharp tiles on top.
-    if (!e->full.tiles.empty() && e->w * z > b->w * 1.03) DrawTiles(*e, v.rot.x, z, cx, cy, a, still);
+    if (tiled) DrawTiles(*e, v.rot.x, z, cx, cy, a, still, v.grid);
 }
 
 void DrawGhosts() {
     for (auto& gh : g_ghosts) {
         const double cx = g.W / 2.0 + gh.panX + gh.offX.x, cy = g.H / 2.0 + gh.panY;
         DrawImage(gh.bmp, gh.imgW, gh.imgH, gh.orient, gh.rot, gh.zoom * gh.scale.x, cx, cy,
-                  (float)std::clamp(gh.alpha.x, 0.0, 1.0), false);
+                  (float)std::clamp(gh.alpha.x, 0.0, 1.0), false, gh.grid);
     }
 }
 
