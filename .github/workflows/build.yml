@@ -1,0 +1,97 @@
+# Builds Glance.exe on every push and pull request.
+#   push to main  -> refreshes the rolling "latest" pre-release
+#   push a v* tag -> publishes a numbered release (e.g. v0.3.0)
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends mingw-w64
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="$(tr -d ' \r\n' < VERSION)-dev+${GITHUB_SHA::7}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Version: $v"
+
+      - name: Build
+        env:
+          GLANCE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./build.sh
+
+      - name: Checksum
+        run: |
+          cd build
+          sha256sum Glance.exe | tee Glance.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glance-${{ steps.version.outputs.version }}
+          path: |
+            build/Glance.exe
+            build/Glance.exe.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Glance-${{ needs.build.outputs.version }}
+          path: out
+
+      - name: Refresh the rolling "latest" build
+        if: github.ref == 'refs/heads/main'
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest out/Glance.exe out/Glance.exe.sha256 \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Latest build (main)" \
+            --notes "Automatic build of \`${GITHUB_SHA::7}\` on main, version $VERSION.
+
+          This is replaced on every push to main. For a stable version, pick a numbered release."
+
+      - name: Publish the numbered release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/Glance.exe out/Glance.exe.sha256 \
+            --verify-tag \
+            --title "Glance $GITHUB_REF_NAME" \
+            --generate-notes
