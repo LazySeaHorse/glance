@@ -49,3 +49,36 @@ inline const wchar_t* NameProblem(const std::wstring& stem) {
 inline uint8_t Unpremultiply(unsigned c, unsigned a) {
     return (uint8_t)(a ? std::min(255u, (c * 255 + a / 2) / a) : 0u);
 }
+
+// The folder's order: by name (numbers inside names compare as numbers) or by date modified.
+enum SortKey { SORT_NAME = 0, SORT_DATE = 1 };
+struct SortOrder {
+    int key = SORT_NAME;
+    bool desc = false;  // name: Z to A; date: oldest first would be asc, so "desc" is newest first
+    bool operator==(const SortOrder& o) const { return key == o.key && desc == o.desc; }
+    bool operator!=(const SortOrder& o) const { return !(*this == o); }
+};
+
+// Does a file come before another? `nameCmp` is the natural-order comparison of their
+// names (negative: first is smaller), `ta` and `tb` their modification times. Files with
+// the same date fall back to name order, whichever way the dates run, so the order is stable.
+inline bool OrderBefore(SortOrder o, int nameCmp, uint64_t ta, uint64_t tb) {
+    if (o.key == SORT_DATE && ta != tb) return o.desc ? ta > tb : ta < tb;
+    if (o.key == SORT_DATE) return nameCmp < 0;
+    return o.desc ? nameCmp > 0 : nameCmp < 0;
+}
+
+// What pressing N or D does: the same key again reverses; a different one switches
+// (names start A to Z, dates start newest first).
+inline SortOrder PressSortKey(SortOrder cur, int key) {
+    if (cur.key == key) cur.desc = !cur.desc;
+    else {
+        cur.key = key;
+        cur.desc = key == SORT_DATE;
+    }
+    return cur;
+}
+
+// For saving in the registry.
+inline uint32_t PackSort(SortOrder o) { return (uint32_t)o.key | (o.desc ? 2u : 0u); }
+inline SortOrder UnpackSort(uint32_t v) { return SortOrder{(v & 1) ? SORT_DATE : SORT_NAME, (v & 2) != 0}; }

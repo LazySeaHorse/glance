@@ -54,6 +54,30 @@ int main() {
     CHECK(Unpremultiply(64, 128) == 127 || Unpremultiply(64, 128) == 128);
     CHECK(Unpremultiply(200, 100) == 255);  // can't exceed white when the data is slightly off
 
+    // ordering
+    const SortOrder nameAsc{SORT_NAME, false}, nameDesc{SORT_NAME, true}, dateNew{SORT_DATE, true}, dateOld{SORT_DATE, false};
+    CHECK(OrderBefore(nameAsc, -1, 5, 1) && !OrderBefore(nameAsc, 1, 1, 5) && !OrderBefore(nameAsc, 0, 1, 1));
+    CHECK(!OrderBefore(nameDesc, -1, 0, 0) && OrderBefore(nameDesc, 1, 0, 0) && !OrderBefore(nameDesc, 0, 0, 0));
+    CHECK(OrderBefore(dateNew, 1, 9, 3) && !OrderBefore(dateNew, -1, 3, 9));  // newer first, names ignored
+    CHECK(OrderBefore(dateOld, 1, 3, 9) && !OrderBefore(dateOld, -1, 9, 3));
+    CHECK(OrderBefore(dateNew, -1, 4, 4) && !OrderBefore(dateNew, 1, 4, 4));  // same date: name A to Z
+    CHECK(OrderBefore(dateOld, -1, 4, 4) && !OrderBefore(dateOld, 1, 4, 4));
+    CHECK(!OrderBefore(dateNew, 0, 4, 4) && !OrderBefore(nameAsc, 0, 4, 4));  // never "before" itself
+
+    SortOrder o = nameAsc;
+    o = PressSortKey(o, SORT_NAME);
+    CHECK(o == nameDesc);
+    o = PressSortKey(o, SORT_NAME);
+    CHECK(o == nameAsc);
+    o = PressSortKey(o, SORT_DATE);
+    CHECK(o == dateNew);
+    o = PressSortKey(o, SORT_DATE);
+    CHECK(o == dateOld);
+    o = PressSortKey(o, SORT_NAME);  // switching resets the direction
+    CHECK(o == nameAsc);
+    for (SortOrder v : {nameAsc, nameDesc, dateNew, dateOld}) CHECK(UnpackSort(PackSort(v)) == v);
+    CHECK(UnpackSort(0xFFFFFFF0u) == nameAsc);  // junk in the registry means the default
+
     if (failures) return 1;
     std::printf("all rules checks passed\n");
     return 0;
